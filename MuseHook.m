@@ -8,7 +8,7 @@
 //
 //  原理：接口是明文 http://IP:6868，Flutter(dart:io) 走 BSD socket，
 //        dylib 用 dyld __interpose 挂 send/write/recv/read，从响应体里捡 m3u8。
-//        UI 用 UIKit 自己建 window（Flutter 的渲染层之上），不需要改 App 本体。
+//        UI 把悬浮球加到应用现有主窗口，列表由现有控制器弹出。
 //
 
 #import <Foundation/Foundation.h>
@@ -417,6 +417,7 @@ static NSArray<MuseCandidate *> *cand_snapshot(void) {
 }
 
 @interface MuseListVC : UITableViewController
+@property (nonatomic, copy) void (^onClose)(void);
 @end
 
 @implementation MuseListVC
@@ -441,7 +442,7 @@ static NSArray<MuseCandidate *> *cand_snapshot(void) {
 }
 
 - (void)close {
-    [self dismissViewControllerAnimated:YES completion:nil];
+    [self dismissViewControllerAnimated:YES completion:self.onClose];
 }
 
 - (void)dealloc {
@@ -575,33 +576,10 @@ static NSArray<MuseCandidate *> *cand_snapshot(void) {
 @end
 
 // ───────────────────────── 悬浮球 + 窗口 ─────────────────────────
-/// 透明穿透视图：点到子视图（悬浮球）就正常响应，点到空白就把事件让给下层 window
-@interface MusePassthroughView : UIView
-@end
-
-@implementation MusePassthroughView
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *v = [super hitTest:point withEvent:event];
-    if (v == self) return nil;    // 空白区域 → 穿透给 Flutter
-    return v;
-}
-@end
-
-@interface MuseRootVC : UIViewController
-@end
-
-@implementation MuseRootVC
-- (void)loadView {
-    MusePassthroughView *v = [[MusePassthroughView alloc] initWithFrame:UIScreen.mainScreen.bounds];
-    v.backgroundColor = UIColor.clearColor;
-    v.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    self.view = v;
-}
-@end
-
 @interface MuseUI : NSObject
-@property (nonatomic, strong) UIWindow *win;
+@property (nonatomic, weak) UIWindow *win;
 @property (nonatomic, strong) UIButton *ball;
+@property (nonatomic, weak) UINavigationController *listController;
 @property (nonatomic, assign) NSInteger retry;
 @end
 
@@ -616,31 +594,38 @@ static NSArray<MuseCandidate *> *cand_snapshot(void) {
 - (void)setup {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            UIWindow *w = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
-            w.windowLevel = UIWindowLevelAlert + 100;
-            w.backgroundColor = UIColor.clearColor;      // 关键：否则整屏盖黑
-            if (@available(iOS 13.0, *)) {
-                for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-                    if ([sc isKindOfClass:[UIWindowScene class]]) { w.windowScene = (UIWindowScene *)sc; break; }
+            if (self.ball.window) return;
+            UIWindow *host = nil;
+            for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+                if (![scene isKindOfClass:[UIWindowScene class]] ||
+                    scene.activationState != UISceneActivationStateForegroundActive) continue;
+                for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+                    if (window.hidden || window.alpha <= 0 ||
+                        window.windowLevel != UIWindowLevelNormal ||
+                        !window.rootViewController) continue;
+                    if (!host || window.isKeyWindow) host = window;
+                    if (window.isKeyWindow) break;
                 }
-                if (w.windowScene == nil) {                   // 场景还没就绪，2 秒后重试（最多 8 次）
-                    if (self.retry < 8) {
-                        self.retry++;
-                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
-                                       dispatch_get_main_queue(), ^{ [self setup]; });
-                    } else {
-                        mlog(@"拿不到 windowScene，跳过悬浮球（可用列表接口直接调）");
-                    }
-                    return;
-                }
+                if (host) break;
             }
-            UIViewController *root = [MuseRootVC new];
-            w.rootViewController = root;
-            w.hidden = NO;
-            self.win = w;
+            if (!host) {
+                if (self.retry < 8) {
+                    self.retry++;
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{ [self setup]; });
+                } else {
+                    mlog(@"等待应用主窗口超时");
+                }
+                return;
+            }
+            self.win = host;
 
             UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
             b.frame = CGRectMake(0, 0, 56, 56);
+            b.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin |
+                                 UIViewAutoresizingFlexibleRightMargin |
+                                 UIViewAutoresizingFlexibleTopMargin |
+                                 UIViewAutoresizingFlexibleBottomMargin;
             b.layer.cornerRadius = 28;
             b.layer.masksToBounds = YES;
             b.backgroundColor = [UIColor colorWithRed:0.49 green:0.30 blue:1.0 alpha:0.92];
@@ -654,14 +639,14 @@ static NSArray<MuseCandidate *> *cand_snapshot(void) {
             UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onPan:)];
             [b addGestureRecognizer:pan];
 
-            CGSize sz = UIScreen.mainScreen.bounds.size;
+            CGSize sz = host.bounds.size;
             b.center = CGPointMake(sz.width - 46, sz.height * 0.42);
-            [root.view addSubview:b];
+            [host addSubview:b];
             self.ball = b;
 
             [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(refreshBadge)
                                                          name:@"MuseBadgeChanged" object:nil];
-            mlog(@"悬浮球已创建");
+            mlog(@"悬浮球已挂到应用主窗口");
         } @catch (NSException *e) {
             mlog(@"UI 创建失败: %@", e);
         }
@@ -671,7 +656,12 @@ static NSArray<MuseCandidate *> *cand_snapshot(void) {
 - (void)onPan:(UIPanGestureRecognizer *)g {
     UIView *v = g.view;
     CGPoint p = [g translationInView:v.superview];
-    v.center = CGPointMake(v.center.x + p.x, v.center.y + p.y);
+    CGRect area = UIEdgeInsetsInsetRect(self.win.bounds, self.win.safeAreaInsets);
+    CGFloat halfWidth = CGRectGetWidth(v.bounds) / 2;
+    CGFloat halfHeight = CGRectGetHeight(v.bounds) / 2;
+    v.center = CGPointMake(
+        MIN(CGRectGetMaxX(area) - halfWidth, MAX(CGRectGetMinX(area) + halfWidth, v.center.x + p.x)),
+        MIN(CGRectGetMaxY(area) - halfHeight, MAX(CGRectGetMinY(area) + halfHeight, v.center.y + p.y)));
     [g setTranslation:CGPointZero inView:v.superview];
 }
 
@@ -687,14 +677,28 @@ static NSArray<MuseCandidate *> *cand_snapshot(void) {
 
 - (void)openList {
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.listController || !self.ball.window) return;
+        UIViewController *presenter = self.ball.window.rootViewController;
+        while (presenter.presentedViewController) {
+            presenter = presenter.presentedViewController;
+        }
+        if (!presenter.view.window || presenter.isBeingPresented || presenter.isBeingDismissed) return;
         gUnseen = 0;
         [self refreshBadge];
         MuseListVC *vc = [MuseListVC new];
+        __weak MuseUI *weakSelf = self;
+        vc.onClose = ^{
+            MuseUI *ui = weakSelf;
+            ui.listController = nil;
+            ui.ball.hidden = NO;
+            [ui.ball.superview bringSubviewToFront:ui.ball];
+        };
         UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
         nav.navigationBar.barStyle = UIBarStyleBlack;
-        UIViewController *root = self.win.rootViewController;
-        if (root.presentedViewController) [root dismissViewControllerAnimated:NO completion:nil];
-        [root presentViewController:nav animated:YES completion:nil];
+        nav.modalPresentationStyle = UIModalPresentationFullScreen;
+        self.listController = nav;
+        self.ball.hidden = YES;
+        [presenter presentViewController:nav animated:YES completion:nil];
     });
 }
 
