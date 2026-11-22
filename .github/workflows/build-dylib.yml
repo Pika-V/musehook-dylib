@@ -29,6 +29,7 @@ jobs:
             -O2 \
             -framework Foundation \
             -framework UIKit \
+            -framework CoreGraphics \
             -framework CoreFoundation \
             -o MuseHook.dylib \
             MuseHook.m
