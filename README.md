@@ -114,6 +114,12 @@ git branch -M main && git push -u origin main
 
 存在这个文件时 dylib 完全不工作（不挂钩逻辑、不建 UI），App 恢复原样——不用卸载注入也能救急。删掉文件后重启 App 即恢复正常。
 
+### 界面点不动 / 触摸全失效
+
+v3 已修。原因是悬浮球挂在了一个**全屏透明 window** 上，而那个 window 会把所有触摸吞掉（Flutter 界面在它下面）。
+
+修法：根视图换成 `MusePassthroughView`，重写 `hitTest:withEvent:`——点到悬浮球才响应，点到空白 `return nil` 把事件让给下层 window（也就是 Flutter）。同时给列表页补了「关闭」按钮（之前点进去出不来）。
+
 ### 其它现象
 
 | 现象 | 处理 |

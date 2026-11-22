@@ -425,15 +425,23 @@ static NSArray<MuseCandidate *> *cand_snapshot(void) {
     [super viewDidLoad];
     self.title = @"暮色下载";
     self.tableView.backgroundColor = [UIColor colorWithWhite:0.10 alpha:1];
-    self.navigationItem.leftBarButtonItem =
-        [[UIBarButtonItem alloc] initWithTitle:@"全选" style:UIBarButtonItemStylePlain
-                                        target:self action:@selector(selAll)];
+    UIBarButtonItem *selAll = [[UIBarButtonItem alloc] initWithTitle:@"全选"
+                                                               style:UIBarButtonItemStylePlain
+                                                              target:self action:@selector(selAll)];
+    UIBarButtonItem *close = [[UIBarButtonItem alloc] initWithTitle:@"关闭"
+                                                              style:UIBarButtonItemStylePlain
+                                                             target:self action:@selector(close)];
+    self.navigationItem.leftBarButtonItems = @[close, selAll];
     self.navigationItem.rightBarButtonItem =
         [[UIBarButtonItem alloc] initWithTitle:@"下载选中" style:UIBarButtonItemStyleDone
                                         target:self action:@selector(downloadSelected)];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(reload)
                                                  name:@"MuseListChanged" object:nil];
     [self updateEmptyHint];
+}
+
+- (void)close {
+    [self dismissViewControllerAnimated:YES completion:nil];
 }
 
 - (void)dealloc {
@@ -567,6 +575,30 @@ static NSArray<MuseCandidate *> *cand_snapshot(void) {
 @end
 
 // ───────────────────────── 悬浮球 + 窗口 ─────────────────────────
+/// 透明穿透视图：点到子视图（悬浮球）就正常响应，点到空白就把事件让给下层 window
+@interface MusePassthroughView : UIView
+@end
+
+@implementation MusePassthroughView
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *v = [super hitTest:point withEvent:event];
+    if (v == self) return nil;    // 空白区域 → 穿透给 Flutter
+    return v;
+}
+@end
+
+@interface MuseRootVC : UIViewController
+@end
+
+@implementation MuseRootVC
+- (void)loadView {
+    MusePassthroughView *v = [[MusePassthroughView alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    v.backgroundColor = UIColor.clearColor;
+    v.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    self.view = v;
+}
+@end
+
 @interface MuseUI : NSObject
 @property (nonatomic, strong) UIWindow *win;
 @property (nonatomic, strong) UIButton *ball;
@@ -602,8 +634,7 @@ static NSArray<MuseCandidate *> *cand_snapshot(void) {
                     return;
                 }
             }
-            UIViewController *root = [UIViewController new];
-            root.view.backgroundColor = UIColor.clearColor;
+            UIViewController *root = [MuseRootVC new];
             w.rootViewController = root;
             w.hidden = NO;
             self.win = w;
