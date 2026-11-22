@@ -670,17 +670,7 @@ static NSArray<MuseCandidate *> *cand_snapshot(void) {
 @end
 
 // ───────────────────────── 流量抓取 ─────────────────────────
-static ssize_t (*orig_send)(int, const void *, size_t, int);
-static ssize_t (*orig_recv)(int, void *, size_t, int);
-static ssize_t (*orig_write)(int, const void *, size_t);
-static ssize_t (*orig_read)(int, void *, size_t);
 static NSString *gLastTitle = nil;   // 从 JSON 里顺手捞的标题
-
-static BOOL is_socket(int fd) {
-    int type = 0; socklen_t len = sizeof(type);
-    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) != 0) return NO;
-    return (type == SOCK_STREAM || type == SOCK_DGRAM);
-}
 
 static NSString *peek_title(NSString *s) {
     NSRange r = [s rangeOfString:@"\"title\""];
@@ -724,29 +714,23 @@ static void scan_buf(const char *buf, size_t n) {
     }
 }
 
+// ───────────────────────── 挂钩（零 dlsym 版） ─────────────────────────
+// 关键修法：只 interpose send / recv，内部改用 **sendto / recvfrom** 调原始实现。
+// 这两个符号没被我们 interpose，所以直接落到 libsystem，不存在：
+//   · dlsym(RTLD_NEXT) 返回 NULL → 空指针调用（上一版闪退的头号原因）
+//   · 自己调自己 → 无限递归
 static ssize_t my_send(int fd, const void *buf, size_t len, int flags) {
-    if (!orig_send) orig_send = dlsym(RTLD_NEXT, "send");
-    if (is_socket(fd)) scan_buf((const char *)buf, len);
-    return orig_send(fd, buf, len, flags);
+    if (gReady && buf && len) {
+        @try { scan_buf((const char *)buf, len); } @catch (__unused NSException *e) {}
+    }
+    return sendto(fd, buf, len, flags, NULL, 0);
 }
 
 static ssize_t my_recv(int fd, void *buf, size_t len, int flags) {
-    if (!orig_recv) orig_recv = dlsym(RTLD_NEXT, "recv");
-    ssize_t n = orig_recv(fd, buf, len, flags);
-    if (n > 0 && is_socket(fd)) scan_buf((const char *)buf, (size_t)n);
-    return n;
-}
-
-static ssize_t my_write(int fd, const void *buf, size_t len) {
-    if (!orig_write) orig_write = dlsym(RTLD_NEXT, "write");
-    if (is_socket(fd)) scan_buf((const char *)buf, len);
-    return orig_write(fd, buf, len);
-}
-
-static ssize_t my_read(int fd, void *buf, size_t len) {
-    if (!orig_read) orig_read = dlsym(RTLD_NEXT, "read");
-    ssize_t n = orig_read(fd, buf, len);
-    if (n > 0 && is_socket(fd)) scan_buf((const char *)buf, (size_t)n);
+    ssize_t n = recvfrom(fd, buf, len, flags, NULL, NULL);
+    if (gReady && n > 0 && buf) {
+        @try { scan_buf((const char *)buf, (size_t)n); } @catch (__unused NSException *e) {}
+    }
     return n;
 }
 
@@ -760,23 +744,38 @@ static ssize_t my_read(int fd, void *buf, size_t len) {
 
 DYLD_INTERPOSE(my_send, send)
 DYLD_INTERPOSE(my_recv, recv)
-DYLD_INTERPOSE(my_write, write)
-DYLD_INTERPOSE(my_read, read)
 
 // ───────────────────────── 入口 ─────────────────────────
+// constructor 里只做一件事：把初始化丢到主队列延后执行。
+// 不建对象、不碰文件、不碰 UIKit —— 上一版就是在这里崩的。
+static void muse_bootstrap(void) {
+    @try {
+        // 紧急开关：/var/mobile/Media/暮色下载/disable 存在 = 完全不工作（救命用）
+        if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Media/暮色下载/disable"]) {
+            return;
+        }
+        gLock = [NSLock new];
+        gCands = [NSMutableArray array];
+        gSeen = [NSMutableDictionary dictionary];
+        gUnseen = 0;
+        (void)out_dir();
+        mlog(@"MuseHook 已注入（手动选择模式）· 输出: %@", out_dir());
+        gReady = YES;
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try { [[MuseUI shared] setup]; }
+            @catch (NSException *e) { mlog(@"UI 失败: %@", e); }
+        });
+    } @catch (NSException *e) {
+        gReady = NO;
+    }
+}
+
 __attribute__((constructor))
 static void muse_init(void) {
-    gLock = [NSLock new];
-    gCands = [NSMutableArray array];
-    gSeen = [NSMutableDictionary dictionary];
-    gUnseen = 0;
-    (void)out_dir();
-    gReady = YES;
-    mlog(@"MuseHook 已注入（手动选择模式）· 输出: %@", out_dir());
-
-    // App 启动完成后再建 UI，避免和 Flutter 抢窗口
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        [[MuseUI shared] setup];
+        muse_bootstrap();
     });
 }

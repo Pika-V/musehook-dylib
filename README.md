@@ -96,13 +96,40 @@ git branch -M main && git push -u origin main
 
 ## 排查
 
+### 打开就闪退
+
+上一版（v1）有两个会秒崩的点，v2 已修：
+
+| v1 的问题 | v2 的改法 |
+|---|---|
+| `dlsym(RTLD_NEXT, "send")` 在 interpose 场景下会返回 NULL → 空指针调用 | **完全不 dlsym**：只 interpose `send`/`recv`，内部改用 `sendto`/`recvfrom` 调原始实现（这两个符号没被挂钩，直接落到 libsystem） |
+| `__attribute__((constructor))` 里就建 ObjC 对象、读写文件、起 UIKit | constructor 只做一件事：把初始化 `dispatch_after(0.6s)` 丢到主队列；对象创建、日志、UI 全在 `muse_bootstrap()` 里，外层 `@try/@catch` |
+| 额外隐患：同时挂钩 `read`/`write` 会影响 App 所有文件 IO | 只挂 `send`/`recv`（socket 专用），不干扰文件读写 |
+
+**救命开关**：Filza 里建一个空文件
+
+```
+/var/mobile/Media/暮色下载/disable
+```
+
+存在这个文件时 dylib 完全不工作（不挂钩逻辑、不建 UI），App 恢复原样——不用卸载注入也能救急。删掉文件后重启 App 即恢复正常。
+
+### 其它现象
+
 | 现象 | 处理 |
 |---|---|
-| 没有悬浮球 | 注入失败或 App 没重启；看 `/var/mobile/Media/暮色下载/hook.log` 是否有「MuseHook 已注入」 |
+| 没有悬浮球，但 App 能开 | 看 `hook.log` 有没有「MuseHook 已注入」；没有就说明 bootstrap 没跑起来，检查是否有 `disable` 文件 |
 | 悬浮球在，但列表一直空 | interpose 没命中 Flutter 的 socket。退而求其次：完整播一遍 → Filza 进暮色沙盒 `Library/Caches/` 按时间取分片 |
 | 有候选，下载全失败 | 分片在 https CDN 上需要 Referer/Token。在 `MuseHook.m` 的 `HTTPAdditionalHeaders` 里补上 Referer 再编一次 |
-| 标题都是「候选 N」 | 该接口的 JSON 里没有 `title` 字段；不影响下载，落盘目录名可用时间戳 |
-| 下载到一半 App 被杀 | 已下分片不保留（内存合并），重下即可 |
+| 标题都是「候选 N」 | 该接口 JSON 里没有 `title` 字段；不影响下载 |
+| 下载到一半 App 被杀 | 已下分片在内存里，未落盘，重下即可 |
+
+### 还是要看崩溃日志
+
+- 手机：设置 → 隐私与安全性 → 分析与改进 → 分析数据 → 找文件名以 `暮色` 或 `Runner` 开头的 `.ips`
+- 或 Filza 进 `/var/mobile/Library/Logs/CrashReporter/`
+
+把 `.ips` 里 `Exception Type` / `Termination Reason` / 第一个 `MuseHook` 帧发我，就能直接定位。
 
 ---
 
