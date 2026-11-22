@@ -38,20 +38,19 @@
 
 ## 原理
 
-Flutter(dart:io) 走 BSD socket。dylib 用 dyld `__interpose` 观察网络读写数据。
+在原生播放器接收数据源时记录播放地址和请求头。
 
-| 挂钩 | 作用 |
+| 入口 | 用途 |
 |---|---|
-| `read` / `recv` / `recvfrom` / `recvmsg` | 读取 socket 返回的 HTTP 数据 |
-| `write` / `send` / `sendto` / `sendmsg` | 重组请求地址和本机播放代理的 `url` 参数 |
-| `close` | 完成按连接关闭结束的响应，清理连接缓存 |
+| BetterPlayerPlugin 的 `handleMethodCall:result:` | 读取 Flutter 传给播放器的 `uri`、请求头和标题 |
+| FSPlayer 的 `prepareToPlay` / `play` | 记录 FSPlayer 使用的播放地址 |
+| AVURLAsset / AVPlayer | 记录 AVFoundation 数据源地址 |
 
-HTTP 按连接及方向重组，处理 Content-Length、chunked、gzip 和 deflate。完整 JSON 由系统解码，播放地址与同一对象的标题一起加入候选。`localhost` 播放代理的外层参数只解码一次，保留内层地址的签名参数。
+这些入口接收已经准备好的 URL，包括 HTTPS 地址和本机播放代理地址。抓取状态、观察点安装情况和真实日志路径显示在列表页的「诊断」里。
 
 命中后**只入队，不下载**。你在列表里点「下载选中」时，才走真正下载流程：
 
-拉 playlist → master 自动选最高码率 → 解析 TS / fMP4（`EXT-X-MAP`、`EXT-X-BYTERANGE`）→
-`AES-128` 自动抓 key 用 CommonCrypto 解密（无 IV 时按 HLS 规范用分片序号）→ 6 并发 + 3 次重试 → 顺序合并成单文件。
+下载器先识别 HLS 或 MP4。HLS 使用重定向后的播放列表地址解析相对分片，处理 TS / fMP4、字节范围和 AES-128 媒体序号 IV。分片暂存到磁盘并按顺序合并，全部成功后才生成成品。普通 MP4 直接下载到磁盘。HTTP 错误、缺分片或不支持的格式会显示失败原因。
 
 UI 把悬浮球直接加到应用现有主窗口，列表使用原生 UIKit 控制器。
 
@@ -73,7 +72,7 @@ git branch -M main && git push -u origin main
 > ```bash
 > SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 > xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=15.0 -isysroot "$SDK" \
->   -fobjc-arc -dynamiclib -O2 -framework Foundation -framework UIKit -framework CoreGraphics -lz \
+>   -fobjc-arc -dynamiclib -O2 -framework Foundation -framework UIKit -framework CoreGraphics \
 >   -o MuseHook.dylib MuseHook.m
 > ldid -S MuseHook.dylib
 > ```
@@ -105,9 +104,9 @@ git branch -M main && git push -u origin main
 
 | v1 的问题 | v2 的改法 |
 |---|---|
-| `dlsym(RTLD_NEXT, "send")` 在 interpose 场景下会返回 NULL → 空指针调用 | 在注入 dylib 内直接调用原始符号，由 dyld 保留这些调用 |
+| 早期 socket interpose 版本依赖底层符号替换 | 当前观察已核对的 Objective-C 播放器方法，保存并调用原方法 |
 | `__attribute__((constructor))` 里就建 ObjC 对象、读写文件、起 UIKit | constructor 只做一件事：把初始化 `dispatch_after(0.6s)` 丢到主队列；对象创建、日志、UI 全在 `muse_bootstrap()` 里，外层 `@try/@catch` |
-| `read`/`write` 同时用于文件和 socket | 采集限定到 stream socket，并保留原调用的返回值和 errno；使用独立队列解析网络数据 |
+| 播放地址在 HTTPS 或解析链路中变化 | 在播放器的数据源入口读取明文 URL 和请求头 |
 
 **救命开关**：Filza 里建一个空文件
 
@@ -126,10 +125,10 @@ git branch -M main && git push -u origin main
 | 现象 | 处理 |
 |---|---|
 | 没有悬浮球，但 App 能开 | 看 `hook.log` 有没有「MuseHook 已注入」；没有就说明 bootstrap 没跑起来，检查是否有 `disable` 文件 |
-| 悬浮球在，但列表一直空 | 播放视频后等约 10 秒，查看 `hook.log` 中的「网络抓取」计数和 HTTP 数量，用这些记录定位抓取入口或协议问题 |
-| 有候选，下载全失败 | 分片在 https CDN 上需要 Referer/Token。在 `MuseHook.m` 的 `HTTPAdditionalHeaders` 里补上 Referer 再编一次 |
+| 悬浮球在，但列表一直空 | 播放视频后点列表右上角「诊断」，复制观察点、播放器调用、播放地址和真实日志路径 |
+| 有候选，下载失败 | 查看「诊断」里的下载错误。播放器传入的请求头会用于下载请求，缺分片或 HTTP 错误会明确报错 |
 | 标题都是「候选 N」 | 该接口 JSON 里没有 `title` 字段；不影响下载 |
-| 下载到一半 App 被杀 | 已下分片在内存里，未落盘，重下即可 |
+| 下载到一半 App 被杀 | 本次下载未完成，重新选择下载；成品会在全部成功后发布 |
 
 ### 还是要看崩溃日志
 
@@ -149,4 +148,4 @@ git branch -M main && git push -u origin main
 └── README.md
 ```
 
-依赖系统提供的 Foundation、UIKit、CoreGraphics、CommonCrypto 和 zlib。
+依赖系统提供的 Foundation、UIKit、CoreGraphics、CommonCrypto 和 Objective-C runtime。

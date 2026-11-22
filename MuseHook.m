@@ -6,14 +6,15 @@
 //    · 暮色界面右侧浮出一个悬浮球，角标 = 新候选数
 //    · 点悬浮球 → 原生列表，勾选 → 点「下载选中」才真正下
 //
-//  原理：接口是明文 http://IP:6868，Flutter(dart:io) 走 BSD socket，
-//        dylib 观察 socket 的读写入口，重组 HTTP 和本机播放代理中的播放地址。
+//  原理：在原生播放器的数据源入口记录 URL 和请求头。
+//        dylib 观察 BetterPlayer、FSPlayer 和 AVURLAsset 收到的明文播放地址。
 //        UI 把悬浮球加到应用现有主窗口，列表由现有控制器弹出。
 //
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 #include <sys/socket.h>
 #include <unistd.h>
@@ -77,12 +78,14 @@ typedef NS_ENUM(NSInteger, CandStatus) {
 
 @interface MuseCandidate : NSObject
 @property (nonatomic, copy) NSString *url;
-@property (nonatomic, copy) NSString *title;
+@property (atomic, copy) NSString *title;
 @property (nonatomic, strong) NSDate *time;
 @property (nonatomic, assign) BOOL selected;
-@property (nonatomic, assign) CandStatus status;
-@property (nonatomic, assign) double progress;   // 0~1
-@property (nonatomic, assign) BOOL isFmp4;
+@property (atomic, assign) CandStatus status;
+@property (atomic, assign) double progress;   // 0~1
+@property (atomic, assign) BOOL isFmp4;
+@property (atomic, copy) NSDictionary<NSString *, NSString *> *headers;
+@property (atomic, copy) NSString *errorText;
 @end
 
 @implementation MuseCandidate
@@ -90,7 +93,7 @@ typedef NS_ENUM(NSInteger, CandStatus) {
 
 // 全局表
 static NSMutableArray<MuseCandidate *> *gCands;   // 最新在前
-static NSMutableDictionary<NSString *, NSNumber *> *gSeen;
+static NSMutableDictionary<NSString *, MuseCandidate *> *gSeen;
 static NSLock *gLock;
 static NSInteger gUnseen = 0;                     // 角标
 static _Atomic(BOOL) gReady = NO;
@@ -101,17 +104,25 @@ static void notify_list_changed(void) {
     });
 }
 
-static MuseCandidate *add_candidate(NSString *url, NSString *title) {
+static MuseCandidate *add_candidate(NSString *url, NSString *title, NSDictionary *headers) {
     if (url.length < 8) return nil;
     [gLock lock];
-    if (gSeen[url]) { [gLock unlock]; return nil; }
-    gSeen[url] = @YES;
+    MuseCandidate *existing = gSeen[url];
+    if (existing) {
+        if (headers.count) existing.headers = headers;
+        if (title.length) existing.title = title;
+        [gLock unlock];
+        notify_list_changed();
+        return existing;
+    }
     MuseCandidate *c = [MuseCandidate new];
     c.url = url;
     c.title = title.length ? title : [NSString stringWithFormat:@"候选 %lu", (unsigned long)(gCands.count + 1)];
     c.time = [NSDate date];
     c.selected = NO;
     c.status = CandIdle;
+    c.headers = headers;
+    gSeen[url] = c;
     [gCands insertObject:c atIndex:0];
     gUnseen++;
     [gLock unlock];
@@ -124,289 +135,794 @@ static MuseCandidate *add_candidate(NSString *url, NSString *title) {
 }
 
 // ───────────────────────── 下载器 ─────────────────────────
-@interface MuseDl : NSObject
+// Downloads are staged on disk and committed only after every piece succeeds.
+#include <CommonCrypto/CommonCryptor.h>
+#include <stdint.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+static NSError *muse_download_error(NSInteger code, NSString *message) {
+    return [NSError errorWithDomain:@"MuseHook.Download" code:code
+                           userInfo:@{NSLocalizedDescriptionKey: message}];
+}
+
+static BOOL muse_download_number(NSString *text, uint64_t *number) {
+    if (!text.length || [text hasPrefix:@"-"] || [text hasPrefix:@"+"]) return NO;
+    const char *start = text.UTF8String;
+    if (!start) return NO;
+    errno = 0;
+    char *end = NULL;
+    unsigned long long value = strtoull(start, &end, 10);
+    if (errno || !end || *end) return NO;
+    *number = value;
+    return YES;
+}
+
+static NSDictionary<NSString *, NSString *> *muse_hls_attributes(NSString *line) {
+    NSRange separator = [line rangeOfString:@":"];
+    if (separator.location == NSNotFound) return @{};
+    NSString *attributes = [line substringFromIndex:NSMaxRange(separator)];
+    static NSRegularExpression *pattern;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        pattern = [NSRegularExpression regularExpressionWithPattern:
+                   @"([A-Z0-9-]+)=(\"[^\"]*\"|[^,]*)" options:0 error:NULL];
+    });
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    for (NSTextCheckingResult *match in [pattern matchesInString:attributes options:0
+                                                           range:NSMakeRange(0, attributes.length)]) {
+        NSString *key = [attributes substringWithRange:[match rangeAtIndex:1]];
+        NSString *value = [attributes substringWithRange:[match rangeAtIndex:2]];
+        if ([value hasPrefix:@"\""] && [value hasSuffix:@"\""])
+            value = [value substringWithRange:NSMakeRange(1, value.length - 2)];
+        result[key] = value;
+    }
+    return result;
+}
+
+static NSURL *muse_hls_url(NSString *reference, NSURL *base) {
+    if (!reference.length) return nil;
+    NSURL *url = [NSURL URLWithString:reference relativeToURL:base].absoluteURL;
+    NSString *scheme = url.scheme.lowercaseString;
+    return ([scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"]) && url.host.length ? url : nil;
+}
+
+static BOOL muse_copy_file_range(NSURL *source, NSURL *destination, uint64_t offset,
+                                 uint64_t length, NSError **error) {
+    NSFileHandle *input = [NSFileHandle fileHandleForReadingFromURL:source error:error];
+    if (!input) return NO;
+    if (![NSFileManager.defaultManager createFileAtPath:destination.path contents:nil attributes:nil]) {
+        [input closeFile];
+        if (error) *error = muse_download_error(1, @"无法创建临时下载文件");
+        return NO;
+    }
+    NSFileHandle *output = [NSFileHandle fileHandleForWritingToURL:destination error:error];
+    if (!output) { [input closeFile]; return NO; }
+    BOOL success = NO;
+    @try {
+        [input seekToFileOffset:offset];
+        while (length) {
+            @autoreleasepool {
+                NSData *data = [input readDataOfLength:(NSUInteger)MIN(length, (uint64_t)65536)];
+                if (!data.length) {
+                    if (error) *error = muse_download_error(2, @"下载内容长度不足");
+                    break;
+                }
+                [output writeData:data];
+                length -= data.length;
+            }
+        }
+        success = length == 0;
+    } @catch (NSException *exception) {
+        if (error) *error = muse_download_error(3, exception.reason ?: @"文件读写失败");
+    } @finally {
+        [input closeFile];
+        [output closeFile];
+    }
+    return success;
+}
+
+@interface MuseDownloadJob : NSObject
+@property (nonatomic, strong) dispatch_semaphore_t done;
+@property (nonatomic, strong) NSURL *destination;
+@property (nonatomic, strong) NSHTTPURLResponse *response;
+@property (nonatomic, strong) NSError *error;
+@property (nonatomic, weak) MuseCandidate *candidate;
+@property (nonatomic, assign) BOOL hasRange;
+@property (nonatomic, assign) uint64_t offset;
+@property (nonatomic, assign) uint64_t length;
+@property (nonatomic, assign) NSTimeInterval lastProgress;
+@end
+@implementation MuseDownloadJob
+@end
+
+@interface MuseDl : NSObject <NSURLSessionDownloadDelegate>
 @property (nonatomic, strong) NSURLSession *session;
-@property (nonatomic, strong) NSMutableDictionary<NSString *, NSData *> *keyCache;
-@property (nonatomic, strong) NSLock *keyLock;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, MuseDownloadJob *> *jobs;
+@property (nonatomic, strong) NSLock *jobsLock;
+@property (nonatomic, strong) NSLock *filesLock;
 @end
 
 @implementation MuseDl
-
 + (instancetype)shared {
-    static MuseDl *s; static dispatch_once_t once;
-    dispatch_once(&once, ^{ s = [MuseDl new]; });
-    return s;
+    static MuseDl *instance;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ instance = [MuseDl new]; });
+    return instance;
 }
 
 - (instancetype)init {
-    if (self = [super init]) {
-        NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
-        cfg.timeoutIntervalForRequest = 30;
-        cfg.HTTPMaximumConnectionsPerHost = 6;
-        cfg.HTTPAdditionalHeaders = @{
-            @"User-Agent": @"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                           @"AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-            @"Accept": @"*/*",
-        };
-        _session = [NSURLSession sessionWithConfiguration:cfg];
-        _keyCache = [NSMutableDictionary dictionary];
-        _keyLock = [NSLock new];
+    if ((self = [super init])) {
+        _jobs = [NSMutableDictionary dictionary];
+        _jobsLock = [NSLock new];
+        _filesLock = [NSLock new];
+        NSURLSessionConfiguration *configuration = NSURLSessionConfiguration.defaultSessionConfiguration;
+        configuration.timeoutIntervalForRequest = 30;
+        configuration.timeoutIntervalForResource = 7200;
+        configuration.HTTPMaximumConnectionsPerHost = 6;
+        _session = [NSURLSession sessionWithConfiguration:configuration delegate:self delegateQueue:nil];
     }
     return self;
 }
 
-- (NSData *)syncGet:(NSString *)url range:(NSString *)range {
-    __block NSData *result = nil;
-    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
-    if (range) [req setValue:range forHTTPHeaderField:@"Range"];
-    NSURLSessionDataTask *t = [_session dataTaskWithRequest:req
-        completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-            if (!e) result = d;
-            dispatch_semaphore_signal(sem);
-        }];
-    [t resume];
-    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 45 * NSEC_PER_SEC));
-    return result;
+- (MuseDownloadJob *)jobForTask:(NSURLSessionTask *)task {
+    [self.jobsLock lock];
+    MuseDownloadJob *job = self.jobs[@(task.taskIdentifier)];
+    [self.jobsLock unlock];
+    return job;
 }
 
-- (NSString *)syncGetText:(NSString *)url {
-    NSData *d = [self syncGet:url range:nil];
-    if (!d) return nil;
-    return [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] ?:
-           [[NSString alloc] initWithData:d encoding:NSISOLatin1StringEncoding];
+- (NSMutableURLRequest *)requestForURL:(NSURL *)url candidate:(MuseCandidate *)candidate range:(NSDictionary *)range {
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    [request setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"
+   forHTTPHeaderField:@"User-Agent"];
+    [request setValue:@"*/*" forHTTPHeaderField:@"Accept"];
+    NSURL *origin = [NSURL URLWithString:candidate.url];
+    NSNumber *originPort = origin.port ?: @([origin.scheme.lowercaseString isEqualToString:@"https"] ? 443 : 80);
+    NSNumber *requestPort = url.port ?: @([url.scheme.lowercaseString isEqualToString:@"https"] ? 443 : 80);
+    BOOL sameOrigin = [origin.host.lowercaseString isEqualToString:url.host.lowercaseString] &&
+                      [origin.scheme.lowercaseString isEqualToString:url.scheme.lowercaseString] &&
+                      [originPort isEqual:requestPort];
+    [gLock lock];
+    NSDictionary *capturedHeaders = candidate.headers;
+    [gLock unlock];
+    for (NSString *name in capturedHeaders) {
+        id value = capturedHeaders[name];
+        if (![name isKindOfClass:NSString.class] || ![value isKindOfClass:NSString.class]) continue;
+        NSString *lower = name.lowercaseString;
+        if ([@[@"host", @"connection", @"content-length", @"range"] containsObject:lower]) continue;
+        if (!sameOrigin && [@[@"authorization", @"cookie"] containsObject:lower]) continue;
+        [request setValue:value forHTTPHeaderField:name];
+    }
+    if (range) {
+        uint64_t start = [range[@"offset"] unsignedLongLongValue];
+        uint64_t length = [range[@"length"] unsignedLongLongValue];
+        [request setValue:[NSString stringWithFormat:@"bytes=%llu-%llu",
+                          (unsigned long long)start, (unsigned long long)(start + length - 1)]
+       forHTTPHeaderField:@"Range"];
+    }
+    return request;
 }
 
-- (NSData *)aes128:(NSData *)data key:(NSData *)key iv:(NSData *)iv {
-    if (key.length != 16) return data;
-    if (iv.length != 16) iv = [NSMutableData dataWithLength:16];
-    size_t outLen = data.length + 32;
-    NSMutableData *out = [NSMutableData dataWithLength:outLen];
-    size_t moved = 0;
-    CCCryptorStatus st = CCCrypt(kCCDecrypt, kCCAlgorithmAES128, 0,
-                                 key.bytes, key.length, iv.bytes,
-                                 data.bytes, data.length,
-                                 out.mutableBytes, outLen, &moved);
-    if (st != kCCSuccess) return data;
-    out.length = moved;
-    const uint8_t *b = out.bytes;
-    if (moved > 0) {
-        uint8_t p = b[moved - 1];
-        if (p >= 1 && p <= 16 && moved >= p) {
-            BOOL ok = YES;
-            for (size_t i = moved - p; i < moved; i++) if (b[i] != p) { ok = NO; break; }
-            if (ok) out.length = moved - p;
+- (MuseDownloadJob *)fetchURL:(NSURL *)url candidate:(MuseCandidate *)candidate range:(NSDictionary *)range
+                   directory:(NSURL *)directory showProgress:(BOOL)showProgress {
+    MuseDownloadJob *last = nil;
+    for (NSUInteger attempt = 0; attempt < 3; attempt++) {
+        MuseDownloadJob *job = [MuseDownloadJob new];
+        job.done = dispatch_semaphore_create(0);
+        job.destination = [directory URLByAppendingPathComponent:NSUUID.UUID.UUIDString];
+        job.candidate = showProgress ? candidate : nil;
+        job.hasRange = range != nil;
+        job.offset = [range[@"offset"] unsignedLongLongValue];
+        job.length = [range[@"length"] unsignedLongLongValue];
+        NSURLSessionDownloadTask *task = [self.session downloadTaskWithRequest:
+                                         [self requestForURL:url candidate:candidate range:range]];
+        [self.jobsLock lock];
+        self.jobs[@(task.taskIdentifier)] = job;
+        [self.jobsLock unlock];
+        [task resume];
+        dispatch_semaphore_wait(job.done, DISPATCH_TIME_FOREVER);
+        last = job;
+        if (!job.error) return job;
+        [NSFileManager.defaultManager removeItemAtURL:job.destination error:NULL];
+        NSInteger status = job.response.statusCode;
+        if (status >= 400 && status < 500 && status != 408 && status != 429) break;
+        if ([job.error.domain isEqualToString:@"MuseHook.Download"] && status < 500) break;
+    }
+    return last;
+}
+
+- (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)task
+ didWriteData:(int64_t)bytesWritten totalBytesWritten:(int64_t)totalBytesWritten
+ totalBytesExpectedToWrite:(int64_t)expected {
+    MuseDownloadJob *job = [self jobForTask:task];
+    if (job.candidate && expected > 0) {
+        NSTimeInterval now = NSDate.timeIntervalSinceReferenceDate;
+        if (now - job.lastProgress < 0.2) return;
+        job.lastProgress = now;
+        job.candidate.progress = MIN(0.95, (double)totalBytesWritten / (double)expected);
+        notify_list_changed();
+    }
+}
+
+- (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)task
+ didFinishDownloadingToURL:(NSURL *)location {
+    MuseDownloadJob *job = [self jobForTask:task];
+    if (!job) return;
+    @try {
+        job.response = [task.response isKindOfClass:NSHTTPURLResponse.class] ? (id)task.response : nil;
+        NSInteger status = job.response.statusCode;
+        if (!job.response || status < 200 || status >= 300) {
+            job.error = muse_download_error(status, [NSString stringWithFormat:@"HTTP 请求失败（%ld）", (long)status]);
+            return;
+        }
+        uint64_t fileLength = [[NSFileManager.defaultManager attributesOfItemAtPath:location.path error:NULL][NSFileSize]
+                               unsignedLongLongValue];
+        if (job.hasRange && status == 200) {
+            if (job.offset > fileLength || job.length > fileLength - job.offset) {
+                job.error = muse_download_error(4, @"服务器返回的内容不足以满足分片范围");
+                return;
+            }
+            NSError *copyError = nil;
+            if (!muse_copy_file_range(location, job.destination, job.offset, job.length, &copyError))
+                job.error = copyError ?: muse_download_error(4, @"分片范围复制失败");
+            return;
+        }
+        if (status == 206) {
+            NSString *header = nil;
+            for (NSString *key in job.response.allHeaderFields) {
+                if ([key.lowercaseString isEqualToString:@"content-range"]) header = job.response.allHeaderFields[key];
+            }
+            static NSRegularExpression *pattern;
+            static dispatch_once_t once;
+            dispatch_once(&once, ^{
+                pattern = [NSRegularExpression regularExpressionWithPattern:@"^bytes ([0-9]+)-([0-9]+)/([0-9]+|\\*)$"
+                                                                   options:NSRegularExpressionCaseInsensitive error:NULL];
+            });
+            NSTextCheckingResult *match = [pattern firstMatchInString:header ?: @"" options:0
+                                                              range:NSMakeRange(0, header.length)];
+            uint64_t start = 0, end = 0, total = 0;
+            BOOL valid = match && muse_download_number([header substringWithRange:[match rangeAtIndex:1]], &start) &&
+                         muse_download_number([header substringWithRange:[match rangeAtIndex:2]], &end) && end >= start;
+            if (valid && job.hasRange) {
+                valid = start == job.offset && end - start + 1 == job.length && fileLength == job.length;
+            } else if (valid) {
+                valid = muse_download_number([header substringWithRange:[match rangeAtIndex:3]], &total) &&
+                        start == 0 && total > 0 && end == total - 1 && fileLength == total;
+            }
+            if (!valid) {
+                job.error = muse_download_error(5, @"服务器仅返回了不完整的内容范围");
+                return;
+            }
+        }
+        NSError *error = nil;
+        if (![NSFileManager.defaultManager moveItemAtURL:location toURL:job.destination error:&error]) job.error = error;
+    } @catch (NSException *exception) {
+        job.error = muse_download_error(31, exception.reason ?: @"下载文件处理失败");
+    }
+}
+
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
+    MuseDownloadJob *job = [self jobForTask:task];
+    if (!job) return;
+    @try {
+        if (error) job.error = error;
+        if (!job.error && ![NSFileManager.defaultManager fileExistsAtPath:job.destination.path])
+            job.error = muse_download_error(6, @"没有收到下载文件");
+    } @catch (NSException *exception) {
+        job.error = muse_download_error(34, exception.reason ?: @"下载完成处理失败");
+    } @finally {
+        [self.jobsLock lock];
+        [self.jobs removeObjectForKey:@(task.taskIdentifier)];
+        [self.jobsLock unlock];
+        dispatch_semaphore_signal(job.done);
+    }
+}
+
+- (NSString *)playlistAtURL:(NSURL *)file error:(NSError **)error {
+    uint64_t length = [[NSFileManager.defaultManager attributesOfItemAtPath:file.path error:error][NSFileSize]
+                       unsignedLongLongValue];
+    if (!length || length > 2 * 1024 * 1024) {
+        if (error) *error = muse_download_error(7, @"播放列表为空或超过可解析大小");
+        return nil;
+    }
+    NSString *text = [NSString stringWithContentsOfURL:file encoding:NSUTF8StringEncoding error:error];
+    NSMutableCharacterSet *trim = [NSCharacterSet.whitespaceAndNewlineCharacterSet mutableCopy];
+    [trim addCharactersInString:@"\ufeff"];
+    text = [text stringByTrimmingCharactersInSet:trim];
+    if (![text hasPrefix:@"#EXTM3U"]) {
+        if (error) *error = muse_download_error(8, @"返回内容不是 HLS 播放列表");
+        return nil;
+    }
+    return text;
+}
+
+- (BOOL)isMP4AtURL:(NSURL *)file {
+    uint64_t length = [[NSFileManager.defaultManager attributesOfItemAtPath:file.path error:NULL][NSFileSize]
+                       unsignedLongLongValue];
+    NSFileHandle *input = [NSFileHandle fileHandleForReadingFromURL:file error:NULL];
+    if (!input) return NO;
+    if (length < 24) { [input closeFile]; return NO; }
+    BOOL hasType = NO, hasMovie = NO, hasMedia = NO, valid = YES;
+    @try {
+        uint64_t offset = 0;
+        NSUInteger boxes = 0;
+        while (offset < length && ++boxes <= 200000) {
+            [input seekToFileOffset:offset];
+            NSData *header = [input readDataOfLength:16];
+            if (header.length < 8) { valid = NO; break; }
+            const uint8_t *bytes = header.bytes;
+            uint64_t size = ((uint64_t)bytes[0] << 24) | ((uint64_t)bytes[1] << 16) |
+                            ((uint64_t)bytes[2] << 8) | bytes[3];
+            uint64_t minimum = 8;
+            if (size == 1) {
+                if (header.length < 16) { valid = NO; break; }
+                minimum = 16;
+                size = 0;
+                for (int index = 8; index < 16; index++) size = (size << 8) | bytes[index];
+            } else if (size == 0) size = length - offset;
+            if (size < minimum || size > length - offset) { valid = NO; break; }
+            hasType |= memcmp(bytes + 4, "ftyp", 4) == 0;
+            hasMovie |= memcmp(bytes + 4, "moov", 4) == 0;
+            hasMedia |= memcmp(bytes + 4, "mdat", 4) == 0;
+            offset += size;
+        }
+        valid &= offset == length;
+    } @catch (__unused NSException *exception) {
+        valid = NO;
+    } @finally {
+        [input closeFile];
+    }
+    return valid && hasType && hasMovie && hasMedia;
+}
+
+- (NSURL *)variantFromPlaylist:(NSString *)text base:(NSURL *)base error:(NSError **)error {
+    NSArray *lines = [text componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet];
+    NSMutableSet *separateAudio = [NSMutableSet set];
+    for (NSString *raw in lines) {
+        NSString *line = [raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        if (![line hasPrefix:@"#EXT-X-MEDIA:"]) continue;
+        NSDictionary *attributes = muse_hls_attributes(line);
+        if ([attributes[@"TYPE"] isEqualToString:@"AUDIO"] && [attributes[@"URI"] length])
+            [separateAudio addObject:attributes[@"GROUP-ID"] ?: @""];
+    }
+    NSURL *best = nil;
+    uint64_t bestBandwidth = 0;
+    BOOL sawVariant = NO;
+    for (NSUInteger index = 0; index < lines.count; index++) {
+        NSString *line = [lines[index] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        if (![line hasPrefix:@"#EXT-X-STREAM-INF:"]) continue;
+        sawVariant = YES;
+        NSDictionary *attributes = muse_hls_attributes(line);
+        if ([separateAudio containsObject:attributes[@"AUDIO"] ?: @""]) continue;
+        uint64_t bandwidth = 0;
+        muse_download_number(attributes[@"BANDWIDTH"], &bandwidth);
+        for (NSUInteger next = index + 1; next < lines.count; next++) {
+            NSString *reference = [lines[next] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+            if (!reference.length || [reference hasPrefix:@"#"]) continue;
+            NSURL *url = muse_hls_url(reference, base);
+            if (url && (!best || bandwidth > bestBandwidth)) { best = url; bestBandwidth = bandwidth; }
+            break;
         }
     }
-    return out;
+    if (sawVariant && !best && error)
+        *error = muse_download_error(9, @"播放列表需要独立音轨封装或没有有效的视频线路");
+    return best;
 }
 
-/// 下载一个候选（后台线程调用），进度通过 candidate.progress 回传
-- (void)downloadCandidate:(MuseCandidate *)cand {
-    @autoreleasepool {
-        @try {
-            NSString *url = cand.url;
-            mlog(@"⬇️ 开始下载: %@", cand.title);
+- (NSDictionary *)rangeForText:(NSString *)text previousEnd:(uint64_t)previousEnd
+                     sameResource:(BOOL)same error:(NSError **)error {
+    NSArray *parts = [text componentsSeparatedByString:@"@"];
+    uint64_t length = 0, offset = previousEnd;
+    BOOL valid = parts.count <= 2 && muse_download_number(parts.firstObject, &length) && length > 0;
+    if (parts.count == 2) valid &= muse_download_number(parts[1], &offset);
+    else valid &= same;
+    valid &= offset <= UINT64_MAX - length;
+    if (!valid) {
+        if (error) *error = muse_download_error(10, @"无效的分片字节范围");
+        return nil;
+    }
+    return @{@"offset": @(offset), @"length": @(length)};
+}
 
-            NSString *text = [self syncGetText:url];
-            if (text.length == 0) {
-                cand.status = CandFailed;
-                notify_list_changed();
-                mlog(@"playlist 拉取失败: %@", url);
-                return;
+- (NSArray<NSDictionary *> *)piecesFromPlaylist:(NSString *)text base:(NSURL *)base
+                                          fmp4:(BOOL *)fmp4 error:(NSError **)error {
+    NSMutableArray *pieces = [NSMutableArray array];
+    NSDictionary *key = nil;
+    NSDictionary *lastMap = nil;
+    NSString *pendingRange = nil;
+    NSURL *lastRangeURL = nil;
+    uint64_t lastRangeEnd = 0, sequence = 0;
+    BOOL sawMedia = NO;
+    for (NSString *raw in [text componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
+        NSString *line = [raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        if (!line.length) continue;
+        if ([line hasPrefix:@"#EXT-X-MEDIA-SEQUENCE:"]) {
+            if (!muse_download_number([line substringFromIndex:22], &sequence)) {
+                if (error) *error = muse_download_error(11, @"无效的媒体分片序号");
+                return nil;
             }
+        } else if ([line hasPrefix:@"#EXT-X-KEY:"]) {
+            NSDictionary *attributes = muse_hls_attributes(line);
+            NSString *method = attributes[@"METHOD"];
+            if ([method isEqualToString:@"NONE"]) { key = nil; continue; }
+            if (![method isEqualToString:@"AES-128"] ||
+                (attributes[@"KEYFORMAT"] && ![attributes[@"KEYFORMAT"] isEqualToString:@"identity"])) {
+                if (error) *error = muse_download_error(12, @"此播放列表的加密方式暂不支持");
+                return nil;
+            }
+            NSURL *keyURL = muse_hls_url(attributes[@"URI"], base);
+            if (!keyURL) {
+                if (error) *error = muse_download_error(13, @"播放列表缺少有效的 AES 密钥地址");
+                return nil;
+            }
+            key = @{@"url": keyURL, @"iv": attributes[@"IV"] ?: @"", @"token": NSUUID.UUID.UUIDString};
+        } else if ([line hasPrefix:@"#EXT-X-MAP:"]) {
+            NSDictionary *attributes = muse_hls_attributes(line);
+            NSURL *url = muse_hls_url(attributes[@"URI"], base);
+            if (!url) { if (error) *error = muse_download_error(14, @"初始化分片地址无效"); return nil; }
+            NSMutableDictionary *map = [@{@"url": url, @"init": @YES} mutableCopy];
+            if (attributes[@"BYTERANGE"]) {
+                NSDictionary *range = [self rangeForText:attributes[@"BYTERANGE"] previousEnd:0 sameResource:YES error:error];
+                if (!range) return nil;
+                map[@"range"] = range;
+            }
+            if (key) {
+                if (![key[@"iv"] length]) {
+                    if (error) *error = muse_download_error(15, @"加密初始化分片需要明确的 IV");
+                    return nil;
+                }
+                map[@"key"] = key;
+            }
+            if (lastMap && ![lastMap isEqual:map] && sawMedia) {
+                if (error) *error = muse_download_error(16, @"多个初始化段需要重新封装，当前下载器暂不支持");
+                return nil;
+            }
+            if (!lastMap || ![lastMap isEqual:map]) [pieces addObject:map];
+            lastMap = map;
+            *fmp4 = YES;
+        } else if ([line hasPrefix:@"#EXT-X-BYTERANGE:"]) {
+            pendingRange = [line substringFromIndex:17];
+        } else if (![line hasPrefix:@"#"]) {
+            NSURL *url = muse_hls_url(line, base);
+            if (!url) { if (error) *error = muse_download_error(17, @"媒体分片地址无效"); return nil; }
+            NSMutableDictionary *piece = [@{@"url": url, @"sequence": @(sequence)} mutableCopy];
+            if (key) piece[@"key"] = key;
+            if (pendingRange) {
+                NSDictionary *range = [self rangeForText:pendingRange previousEnd:lastRangeEnd
+                                            sameResource:[url isEqual:lastRangeURL] error:error];
+                if (!range) return nil;
+                piece[@"range"] = range;
+                lastRangeEnd = [range[@"offset"] unsignedLongLongValue] + [range[@"length"] unsignedLongLongValue];
+                lastRangeURL = url;
+                pendingRange = nil;
+            } else lastRangeURL = nil;
+            [pieces addObject:piece];
+            sawMedia = YES;
+            if (sequence == UINT64_MAX) { if (error) *error = muse_download_error(18, @"分片序号溢出"); return nil; }
+            sequence++;
+        }
+    }
+    if (!sawMedia || pendingRange) {
+        if (error) *error = muse_download_error(19, @"没有完整的媒体分片列表");
+        return nil;
+    }
+    return pieces;
+}
 
-            NSString *base = url;
-            if ([text containsString:@"#EXT-X-STREAM-INF"]) {
-                NSArray *lines = [text componentsSeparatedByString:@"\n"];
-                NSString *best = nil; NSInteger bestBw = -1;
-                for (NSUInteger i = 0; i < lines.count; i++) {
-                    NSString *l = [lines[i] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
-                    if (![l hasPrefix:@"#EXT-X-STREAM-INF"]) continue;
-                    NSInteger bw = 0;
-                    NSRange rb = [l rangeOfString:@"BANDWIDTH="];
-                    if (rb.location != NSNotFound) bw = [[l substringFromIndex:rb.location + rb.length] integerValue];
-                    for (NSUInteger j = i + 1; j < lines.count; j++) {
-                        NSString *n = [lines[j] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
-                        if (n.length == 0 || [n hasPrefix:@"#"]) continue;
-                        if (bw > bestBw) { bestBw = bw; best = n; }
+- (NSData *)ivForKey:(NSDictionary *)key sequence:(uint64_t)sequence error:(NSError **)error {
+    NSMutableData *iv = [NSMutableData dataWithLength:16];
+    NSString *explicit = key[@"iv"];
+    if (explicit.length) {
+        if (![explicit hasPrefix:@"0x"] && ![explicit hasPrefix:@"0X"]) {
+            if (error) *error = muse_download_error(20, @"AES IV 格式无效");
+            return nil;
+        }
+        NSString *hex = [explicit substringFromIndex:2];
+        if (!hex.length || hex.length > 32 ||
+            [hex rangeOfCharacterFromSet:[[NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdefABCDEF"] invertedSet]].location != NSNotFound) {
+            if (error) *error = muse_download_error(20, @"AES IV 格式无效");
+            return nil;
+        }
+        hex = [[@"" stringByPaddingToLength:32 - hex.length withString:@"0" startingAtIndex:0] stringByAppendingString:hex];
+        for (NSUInteger index = 0; index < 16; index++) {
+            unsigned int byte = 0;
+            sscanf([[hex substringWithRange:NSMakeRange(index * 2, 2)] UTF8String], "%2x", &byte);
+            ((uint8_t *)iv.mutableBytes)[index] = byte;
+        }
+    } else {
+        for (int index = 15; index >= 8; index--) {
+            ((uint8_t *)iv.mutableBytes)[index] = (uint8_t)sequence;
+            sequence >>= 8;
+        }
+    }
+    return iv;
+}
+
+- (BOOL)decryptFile:(NSURL *)inputURL output:(NSURL *)outputURL key:(NSData *)key
+                iv:(NSData *)iv error:(NSError **)error {
+    if (key.length != 16 || iv.length != 16) {
+        if (error) *error = muse_download_error(21, @"AES 密钥或 IV 长度错误");
+        return NO;
+    }
+    CCCryptorRef cryptor = NULL;
+    CCCryptorStatus status = CCCryptorCreate(kCCDecrypt, kCCAlgorithmAES128, kCCOptionPKCS7Padding,
+                                            key.bytes, key.length, iv.bytes, &cryptor);
+    if (status != kCCSuccess) { if (error) *error = muse_download_error(22, @"无法初始化 AES 解密"); return NO; }
+    NSFileHandle *input = [NSFileHandle fileHandleForReadingFromURL:inputURL error:error];
+    [NSFileManager.defaultManager createFileAtPath:outputURL.path contents:nil attributes:nil];
+    NSFileHandle *output = [NSFileHandle fileHandleForWritingToURL:outputURL error:error];
+    if (!input || !output) {
+        [input closeFile]; [output closeFile]; CCCryptorRelease(cryptor); return NO;
+    }
+    BOOL success = NO;
+    @try {
+        unsigned char decoded[65536 + kCCBlockSizeAES128];
+        while (YES) {
+            @autoreleasepool {
+                NSData *data = [input readDataOfLength:65536];
+                if (!data.length) break;
+                size_t moved = 0;
+                status = CCCryptorUpdate(cryptor, data.bytes, data.length, decoded, sizeof(decoded), &moved);
+                if (status != kCCSuccess) break;
+                [output writeData:[NSData dataWithBytes:decoded length:moved]];
+            }
+        }
+        if (status == kCCSuccess) {
+            size_t moved = 0;
+            status = CCCryptorFinal(cryptor, decoded, sizeof(decoded), &moved);
+            if (status == kCCSuccess) [output writeData:[NSData dataWithBytes:decoded length:moved]];
+        }
+        success = status == kCCSuccess;
+        if (!success && error) *error = muse_download_error(23, @"AES 解密失败，分片未写入成品");
+    } @catch (NSException *exception) {
+        if (error) *error = muse_download_error(24, exception.reason ?: @"解密文件读写失败");
+    } @finally {
+        [input closeFile]; [output closeFile]; CCCryptorRelease(cryptor);
+    }
+    return success;
+}
+
+- (BOOL)validateMediaFile:(NSURL *)file initialization:(BOOL)initialization fmp4:(BOOL)fmp4
+                    error:(NSError **)error {
+    uint64_t length = [[NSFileManager.defaultManager attributesOfItemAtPath:file.path error:error][NSFileSize]
+                       unsignedLongLongValue];
+    NSFileHandle *input = [NSFileHandle fileHandleForReadingFromURL:file error:error];
+    if (!input) return NO;
+    BOOL valid = NO;
+    @try {
+        if (fmp4) {
+            BOOL movie = NO, fragment = NO, media = NO;
+            uint64_t offset = 0;
+            NSUInteger boxes = 0;
+            valid = length >= 8;
+            while (valid && offset < length && ++boxes <= 200000) {
+                @autoreleasepool {
+                    [input seekToFileOffset:offset];
+                    NSData *header = [input readDataOfLength:16];
+                    if (header.length < 8) { valid = NO; break; }
+                    const uint8_t *bytes = header.bytes;
+                    uint64_t size = ((uint64_t)bytes[0] << 24) | ((uint64_t)bytes[1] << 16) |
+                                    ((uint64_t)bytes[2] << 8) | bytes[3];
+                    uint64_t minimum = 8;
+                    if (size == 1) {
+                        if (header.length < 16) { valid = NO; break; }
+                        minimum = 16;
+                        size = 0;
+                        for (int index = 8; index < 16; index++) size = (size << 8) | bytes[index];
+                    } else if (!size) size = length - offset;
+                    if (size < minimum || size > length - offset) { valid = NO; break; }
+                    movie |= memcmp(bytes + 4, "moov", 4) == 0;
+                    fragment |= memcmp(bytes + 4, "moof", 4) == 0;
+                    media |= memcmp(bytes + 4, "mdat", 4) == 0;
+                    offset += size;
+                }
+            }
+            valid &= offset == length && (initialization ? movie : (fragment && media));
+        } else {
+            NSData *prefix = [input readDataOfLength:(NSUInteger)MIN(length, (uint64_t)(192 * 5))];
+            const uint8_t *bytes = prefix.bytes;
+            for (NSUInteger stride = 188; stride <= 192; stride += 4) {
+                NSUInteger first = stride == 188 ? 0 : 4;
+                if (length < stride || length % stride != 0) continue;
+                BOOL synchronized = YES;
+                for (NSUInteger offset = first; offset < prefix.length; offset += stride) {
+                    if (bytes[offset] != 0x47) { synchronized = NO; break; }
+                }
+                if (synchronized) { valid = YES; break; }
+            }
+        }
+    } @catch (NSException *exception) {
+        if (error) *error = muse_download_error(32, exception.reason ?: @"媒体分片读取失败");
+        valid = NO;
+    } @finally {
+        [input closeFile];
+    }
+    if (!valid && error && !*error)
+        *error = muse_download_error(33, @"分片响应不是有效的 TS/fMP4 数据，可能返回了登录页或错误页面");
+    return valid;
+}
+
+- (NSURL *)assemblePieces:(NSArray<NSDictionary *> *)pieces candidate:(MuseCandidate *)candidate
+                directory:(NSURL *)directory error:(NSError **)error {
+    NSMutableDictionary *keys = [NSMutableDictionary dictionary];
+    for (NSDictionary *piece in pieces) {
+        NSDictionary *key = piece[@"key"];
+        if (!key || keys[key[@"token"]]) continue;
+        MuseDownloadJob *job = [self fetchURL:key[@"url"] candidate:candidate range:nil directory:directory showProgress:NO];
+        if (job.error) { if (error) *error = job.error; return nil; }
+        uint64_t keyLength = [[NSFileManager.defaultManager attributesOfItemAtPath:job.destination.path error:NULL][NSFileSize]
+                              unsignedLongLongValue];
+        if (keyLength != 16) { if (error) *error = muse_download_error(25, @"AES 密钥响应不是 16 字节"); return nil; }
+        NSData *bytes = [NSData dataWithContentsOfURL:job.destination];
+        if (bytes.length != 16) { if (error) *error = muse_download_error(25, @"AES 密钥读取失败"); return nil; }
+        keys[key[@"token"]] = bytes;
+    }
+    NSOperationQueue *workers = [NSOperationQueue new];
+    workers.maxConcurrentOperationCount = 6;
+    NSLock *resultsLock = [NSLock new];
+    NSMutableArray *files = [NSMutableArray arrayWithCapacity:pieces.count];
+    for (NSUInteger index = 0; index < pieces.count; index++) [files addObject:NSNull.null];
+    __block NSError *firstError = nil;
+    __block NSUInteger completed = 0;
+    for (NSUInteger index = 0; index < pieces.count; index++) {
+        [workers addOperationWithBlock:^{
+            @autoreleasepool {
+                NSDictionary *piece = pieces[index];
+                NSError *pieceError = nil;
+                NSURL *file = nil;
+                @try {
+                    MuseDownloadJob *job = [self fetchURL:piece[@"url"] candidate:candidate range:piece[@"range"]
+                                              directory:directory showProgress:NO];
+                    pieceError = job.error;
+                    file = job.destination;
+                    NSDictionary *key = piece[@"key"];
+                    if (!pieceError && key) {
+                        NSData *iv = [self ivForKey:key sequence:[piece[@"sequence"] unsignedLongLongValue] error:&pieceError];
+                        NSURL *decoded = [directory URLByAppendingPathComponent:NSUUID.UUID.UUIDString];
+                        if (iv && [self decryptFile:file output:decoded key:keys[key[@"token"]] iv:iv error:&pieceError]) file = decoded;
+                    }
+                    uint64_t length = [[NSFileManager.defaultManager attributesOfItemAtPath:file.path error:NULL][NSFileSize]
+                                       unsignedLongLongValue];
+                    if (!pieceError && !length) pieceError = muse_download_error(26, @"媒体分片为空");
+                    if (!pieceError)
+                        [self validateMediaFile:file initialization:[piece[@"init"] boolValue] fmp4:candidate.isFmp4 error:&pieceError];
+                } @catch (NSException *exception) {
+                    pieceError = muse_download_error(35, exception.reason ?: @"媒体分片处理失败");
+                }
+                [resultsLock lock];
+                if (pieceError && !firstError) firstError = pieceError;
+                if (!pieceError) files[index] = file;
+                completed++;
+                candidate.progress = 0.95 * (double)completed / (double)pieces.count;
+                [resultsLock unlock];
+                notify_list_changed();
+            }
+        }];
+    }
+    [workers waitUntilAllOperationsAreFinished];
+    if (firstError) { if (error) *error = firstError; return nil; }
+    NSURL *merged = [directory URLByAppendingPathComponent:@"merged"];
+    [NSFileManager.defaultManager createFileAtPath:merged.path contents:nil attributes:nil];
+    NSFileHandle *output = [NSFileHandle fileHandleForWritingToURL:merged error:error];
+    if (!output) return nil;
+    BOOL success = YES;
+    @try {
+        for (NSURL *file in files) {
+            NSFileHandle *input = [NSFileHandle fileHandleForReadingFromURL:file error:error];
+            if (!input) { success = NO; break; }
+            @try {
+                while (YES) {
+                    @autoreleasepool {
+                        NSData *data = [input readDataOfLength:65536];
+                        if (!data.length) break;
+                        [output writeData:data];
+                    }
+                }
+            } @finally { [input closeFile]; }
+        }
+    } @catch (NSException *exception) {
+        success = NO;
+        if (error) *error = muse_download_error(27, exception.reason ?: @"分片合并失败");
+    } @finally { [output closeFile]; }
+    return success ? merged : nil;
+}
+
+- (NSURL *)commitFile:(NSURL *)staged directory:(NSURL *)directory name:(NSString *)name
+            extension:(NSString *)extension error:(NSError **)error {
+    [self.filesLock lock];
+    NSURL *destination = nil;
+    @try {
+        NSUInteger suffix = 1;
+        do {
+            NSString *filename = suffix == 1 ? [name stringByAppendingPathExtension:extension] :
+                [[NSString stringWithFormat:@"%@ (%lu)", name, (unsigned long)suffix] stringByAppendingPathExtension:extension];
+            destination = [directory URLByAppendingPathComponent:filename];
+            suffix++;
+        } while ([NSFileManager.defaultManager fileExistsAtPath:destination.path]);
+        if (![NSFileManager.defaultManager moveItemAtURL:staged toURL:destination error:error]) destination = nil;
+    } @finally { [self.filesLock unlock]; }
+    return destination;
+}
+
+- (void)downloadCandidate:(MuseCandidate *)candidate {
+    @autoreleasepool {
+        NSURL *working = nil;
+        NSError *error = nil;
+        NSURL *completed = nil;
+        @try {
+            candidate.status = CandRunning;
+            candidate.errorText = nil;
+            candidate.progress = 0;
+            notify_list_changed();
+            NSString *safe = [[candidate.title componentsSeparatedByCharactersInSet:
+                              [NSCharacterSet characterSetWithCharactersInString:@"/\\:*?\"<>|\n\r"]]
+                             componentsJoinedByString:@"_"];
+            if (!safe.length || [safe isEqualToString:@"."] || [safe isEqualToString:@".."]) safe = @"MuseVideo";
+            if (safe.length > 60) safe = [safe substringWithRange:[safe rangeOfComposedCharacterSequencesForRange:NSMakeRange(0, 60)]];
+            if ([safe lengthOfBytesUsingEncoding:NSUTF8StringEncoding] > 180) safe = @"MuseVideo";
+            NSURL *directory = [NSURL fileURLWithPath:[out_dir() stringByAppendingPathComponent:safe] isDirectory:YES];
+            if (![NSFileManager.defaultManager createDirectoryAtURL:directory withIntermediateDirectories:YES attributes:nil error:&error])
+                @throw [NSException exceptionWithName:@"MuseDownload" reason:error.localizedDescription userInfo:nil];
+            working = [directory URLByAppendingPathComponent:[@".work-" stringByAppendingString:NSUUID.UUID.UUIDString] isDirectory:YES];
+            if (![NSFileManager.defaultManager createDirectoryAtURL:working withIntermediateDirectories:NO attributes:nil error:&error])
+                @throw [NSException exceptionWithName:@"MuseDownload" reason:error.localizedDescription userInfo:nil];
+            NSURL *url = muse_hls_url(candidate.url, nil);
+            if (!url) @throw [NSException exceptionWithName:@"MuseDownload" reason:@"播放地址无效" userInfo:nil];
+            MuseDownloadJob *root = [self fetchURL:url candidate:candidate range:nil directory:working showProgress:YES];
+            if (root.error) error = root.error;
+            NSURL *mediaFile = nil;
+            NSString *extension = @"mp4";
+            if (!error && [self isMP4AtURL:root.destination]) {
+                candidate.isFmp4 = YES;
+                mediaFile = root.destination;
+            } else if (!error) {
+                NSString *text = [self playlistAtURL:root.destination error:&error];
+                NSURL *base = root.response.URL;
+                NSMutableSet *visited = [NSMutableSet set];
+                for (NSUInteger depth = 0; text && [text containsString:@"#EXT-X-STREAM-INF:"] && depth < 5; depth++) {
+                    NSURL *variant = [self variantFromPlaylist:text base:base error:&error];
+                    if (!variant || [visited containsObject:variant.absoluteString]) {
+                        if (!error) error = muse_download_error(28, @"播放列表循环引用");
+                        text = nil;
                         break;
                     }
+                    [visited addObject:variant.absoluteString];
+                    MuseDownloadJob *next = [self fetchURL:variant candidate:candidate range:nil directory:working showProgress:NO];
+                    if (next.error) { error = next.error; text = nil; break; }
+                    base = next.response.URL;
+                    text = [self playlistAtURL:next.destination error:&error];
                 }
-                if (best) {
-                    base = [NSURL URLWithString:best relativeToURL:[NSURL URLWithString:url]].absoluteString;
-                    text = [self syncGetText:base] ?: text;
+                if (text && [text containsString:@"#EXT-X-STREAM-INF:"]) {
+                    error = muse_download_error(29, @"播放列表嵌套过深");
+                    text = nil;
                 }
+                BOOL fmp4 = NO;
+                NSArray *pieces = text ? [self piecesFromPlaylist:text base:base fmp4:&fmp4 error:&error] : nil;
+                candidate.isFmp4 = fmp4;
+                extension = fmp4 ? @"mp4" : @"ts";
+                if (pieces) mediaFile = [self assemblePieces:pieces candidate:candidate directory:working error:&error];
             }
-
-            NSMutableArray<NSDictionary *> *segs = [NSMutableArray array];
-            NSDictionary *curKey = nil;
-            NSDictionary *initSeg = nil;
-            NSInteger pendLen = -1; long long curOff = 0, lastEnd = 0;
-
-            for (NSString *raw in [text componentsSeparatedByString:@"\n"]) {
-                NSString *l = [raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
-                if (l.length == 0) continue;
-                if ([l hasPrefix:@"#EXT-X-KEY"]) {
-                    if ([l containsString:@"AES-128"]) {
-                        NSRange ru = [l rangeOfString:@"URI=\""];
-                        NSRange ri = [l rangeOfString:@"IV=0x"];
-                        NSString *ku = nil, *ivs = nil;
-                        if (ru.location != NSNotFound) {
-                            NSString *rest = [l substringFromIndex:ru.location + ru.length];
-                            NSRange q = [rest rangeOfString:@"\""];
-                            if (q.location != NSNotFound) ku = [rest substringToIndex:q.location];
-                        }
-                        if (ri.location != NSNotFound) {
-                            NSString *rest = [l substringFromIndex:ri.location + ri.length];
-                            NSMutableString *hex = [NSMutableString string];
-                            for (NSUInteger k = 0; k < rest.length; k++) {
-                                unichar ch = [rest characterAtIndex:k];
-                                if (isxdigit(ch)) [hex appendFormat:@"%C", ch]; else break;
-                            }
-                            ivs = hex;
-                        }
-                        curKey = ku ? @{@"uri": [NSURL URLWithString:ku relativeToURL:[NSURL URLWithString:base]].absoluteString,
-                                        @"iv": ivs ?: @""} : nil;
-                    } else {
-                        curKey = nil;
-                    }
-                } else if ([l hasPrefix:@"#EXT-X-MAP"]) {
-                    NSRange ru = [l rangeOfString:@"URI=\""];
-                    NSRange rb = [l rangeOfString:@"BYTERANGE=\""];
-                    if (ru.location != NSNotFound) {
-                        NSString *rest = [l substringFromIndex:ru.location + ru.length];
-                        NSRange q = [rest rangeOfString:@"\""];
-                        if (q.location != NSNotFound) {
-                            NSString *u = [rest substringToIndex:q.location];
-                            NSMutableDictionary *d = [@{@"u": [NSURL URLWithString:u relativeToURL:[NSURL URLWithString:base]].absoluteString,
-                                                        @"init": @YES} mutableCopy];
-                            if (rb.location != NSNotFound) {
-                                NSString *r2 = [l substringFromIndex:rb.location + rb.length];
-                                NSRange q2 = [r2 rangeOfString:@"\""];
-                                if (q2.location != NSNotFound) {
-                                    NSArray *pp = [[r2 substringToIndex:q2.location] componentsSeparatedByString:@"@"];
-                                    long long ln = [pp[0] longLongValue];
-                                    long long st = pp.count > 1 ? [pp[1] longLongValue] : 0;
-                                    d[@"range"] = [NSString stringWithFormat:@"bytes=%lld-%lld", st, st + ln - 1];
-                                    d[@"fmp4"] = @YES;
-                                }
-                            }
-                            initSeg = d;
-                        }
-                    }
-                } else if ([l hasPrefix:@"#EXT-X-BYTERANGE"]) {
-                    NSString *rest = [l substringFromIndex:[l rangeOfString:@":"].location + 1];
-                    NSArray *pp = [rest componentsSeparatedByString:@"@"];
-                    pendLen = [pp[0] integerValue];
-                    curOff = pp.count > 1 ? [pp[1] longLongValue] : lastEnd;
-                } else if (![l hasPrefix:@"#"]) {
-                    NSMutableDictionary *d = [@{@"u": [NSURL URLWithString:l relativeToURL:[NSURL URLWithString:base]].absoluteString} mutableCopy];
-                    if (curKey) d[@"key"] = curKey;
-                    if (pendLen >= 0) {
-                        d[@"range"] = [NSString stringWithFormat:@"bytes=%lld-%lld", curOff, curOff + pendLen - 1];
-                        d[@"fmp4"] = @YES;
-                        lastEnd = curOff + pendLen;
-                        pendLen = -1;
-                    }
-                    [segs addObject:d];
-                }
-            }
-            if (segs.count == 0) {
-                cand.status = CandFailed;
-                notify_list_changed();
-                mlog(@"没解析到分片: %@", url);
-                return;
-            }
-
-            cand.isFmp4 = (initSeg != nil) || ([[segs.firstObject objectForKey:@"fmp4"] boolValue]);
-            NSString *safe = [[cand.title componentsSeparatedByCharactersInSet:
-                               [NSCharacterSet characterSetWithCharactersInString:@"/\\:*?\"<>|\n\r"]]
-                              componentsJoinedByString:@"_"];
-            NSString *dir = [out_dir() stringByAppendingPathComponent:safe];
-            [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-
-            NSMutableArray *pieces = [NSMutableArray array];
-            if (initSeg) [pieces addObject:initSeg];
-            [pieces addObjectsFromArray:segs];
-            NSInteger total = pieces.count;
-
-            __block NSInteger done = 0;
-            NSMutableArray *bufs = [NSMutableArray array];
-            for (NSInteger i = 0; i < total; i++) [bufs addObject:[NSNull null]];
-            NSLock *lk = [NSLock new];
-
-            dispatch_semaphore_t limit = dispatch_semaphore_create(6);
-            dispatch_group_t grp = dispatch_group_create();
-            for (NSInteger i = 0; i < total; i++) {
-                dispatch_group_async(grp, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                    dispatch_semaphore_wait(limit, DISPATCH_TIME_FOREVER);
-                    @autoreleasepool {
-                        NSDictionary *d = pieces[i];
-                        NSData *data = nil;
-                        for (int a = 0; a < 3 && !data; a++) data = [self syncGet:d[@"u"] range:d[@"range"]];
-                        NSDictionary *k = d[@"key"];
-                        if (data && k) {
-                            NSString *kuri = k[@"uri"];
-                            [self.keyLock lock];
-                            NSData *kb = self.keyCache[kuri];
-                            [self.keyLock unlock];
-                            if (!kb) {
-                                kb = [self syncGet:kuri range:nil];
-                                if (kb) {
-                                    [self.keyLock lock];
-                                    self.keyCache[kuri] = kb;
-                                    [self.keyLock unlock];
-                                }
-                            }
-                            NSMutableData *iv = [NSMutableData dataWithLength:16];
-                            NSString *ivs = k[@"iv"];
-                            if (ivs.length >= 32) {
-                                for (int n = 0; n < 16; n++) {
-                                    unsigned int byte = 0;
-                                    sscanf([[ivs substringWithRange:NSMakeRange(n * 2, 2)] UTF8String], "%02x", &byte);
-                                    ((uint8_t *)iv.mutableBytes)[n] = byte;
-                                }
-                            } else {
-                                uint32_t seq = htonl((uint32_t)(i - (initSeg ? 1 : 0)));
-                                memcpy((uint8_t *)iv.mutableBytes + 12, &seq, 4);
-                            }
-                            data = [self aes128:data key:kb iv:iv];
-                        }
-                        [lk lock];
-                        if (data) bufs[i] = data;
-                        done++;
-                        cand.progress = total > 0 ? (double)done / total : 0;
-                        BOOL tick = (done % 5 == 0) || done == total;
-                        [lk unlock];
-                        if (tick) notify_list_changed();
-                        dispatch_semaphore_signal(limit);
-                    }
-                });
-            }
-            dispatch_group_wait(grp, dispatch_time(DISPATCH_TIME_NOW, 7200ull * NSEC_PER_SEC));
-
-            NSMutableData *merged = [NSMutableData data];
-            for (id b in bufs) if ([b isKindOfClass:[NSData class]]) [merged appendData:b];
-            if (merged.length == 0) {
-                cand.status = CandFailed;
-                cand.progress = 0;
-                notify_list_changed();
-                mlog(@"❌ 全部失败: %@", cand.title);
-                return;
-            }
-            NSString *out = [dir stringByAppendingPathComponent:
-                             [safe stringByAppendingString:cand.isFmp4 ? @".mp4" : @".ts"]];
-            [merged writeToFile:out atomically:YES];
-            cand.status = CandDone;
-            cand.progress = 1;
-            notify_list_changed();
-            mlog(@"✅ 完成: %@ (%lu KB)", out, (unsigned long)(merged.length / 1024));
-        } @catch (NSException *e) {
-            cand.status = CandFailed;
-            notify_list_changed();
-            mlog(@"异常: %@", e);
+            if (mediaFile && !error) completed = [self commitFile:mediaFile directory:directory name:safe extension:extension error:&error];
+        } @catch (NSException *exception) {
+            if (!error) error = muse_download_error(30, exception.reason ?: @"下载失败");
+        } @finally {
+            if (working) [NSFileManager.defaultManager removeItemAtURL:working error:NULL];
         }
+        if (completed) {
+            candidate.status = CandDone;
+            candidate.progress = 1;
+            candidate.errorText = nil;
+            mlog(@"下载完成: %@", completed.path);
+        } else {
+            candidate.status = CandFailed;
+            candidate.progress = 0;
+            candidate.errorText = error.localizedDescription ?: @"下载未完成";
+            mlog(@"下载失败: %@", candidate.errorText);
+        }
+        notify_list_changed();
     }
 }
 @end
@@ -418,6 +934,8 @@ static NSArray<MuseCandidate *> *cand_snapshot(void) {
     [gLock unlock];
     return a;
 }
+
+static NSString *muse_diagnostic_report(void);
 
 @interface MuseListVC : UITableViewController
 @property (nonatomic, copy) void (^onClose)(void);
@@ -436,9 +954,13 @@ static NSArray<MuseCandidate *> *cand_snapshot(void) {
                                                               style:UIBarButtonItemStylePlain
                                                              target:self action:@selector(close)];
     self.navigationItem.leftBarButtonItems = @[close, selAll];
-    self.navigationItem.rightBarButtonItem =
+    UIBarButtonItem *download =
         [[UIBarButtonItem alloc] initWithTitle:@"下载选中" style:UIBarButtonItemStyleDone
                                         target:self action:@selector(downloadSelected)];
+    UIBarButtonItem *diagnostics =
+        [[UIBarButtonItem alloc] initWithTitle:@"诊断" style:UIBarButtonItemStylePlain
+                                        target:self action:@selector(showDiagnostics)];
+    self.navigationItem.rightBarButtonItems = @[download, diagnostics];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(reload)
                                                  name:@"MuseListChanged" object:nil];
     [self updateEmptyHint];
@@ -446,6 +968,25 @@ static NSArray<MuseCandidate *> *cand_snapshot(void) {
 
 - (void)close {
     [self dismissViewControllerAnimated:YES completion:self.onClose];
+}
+
+- (void)showDiagnostics {
+    NSString *report = muse_diagnostic_report();
+    for (MuseCandidate *candidate in cand_snapshot()) {
+        if (candidate.errorText.length) {
+            report = [report stringByAppendingFormat:@"\n下载错误 %@", candidate.errorText];
+            break;
+        }
+    }
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"MuseHook 诊断"
+                                                                 message:report
+                                                          preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"复制" style:UIAlertActionStyleDefault
+                                          handler:^(__unused UIAlertAction *action) {
+        UIPasteboard.generalPasteboard.string = report;
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)dealloc {
@@ -466,7 +1007,7 @@ static NSArray<MuseCandidate *> *cand_snapshot(void) {
         l.textAlignment = NSTextAlignmentCenter;
         l.textColor = [UIColor colorWithWhite:0.6 alpha:1];
         l.font = [UIFont systemFontOfSize:14];
-        l.text = @"还没有候选。\n\n回暮色播任意视频几秒，\n这里就会出现可下载的条目，\n勾选后点右上角「下载选中」。";
+        l.text = [NSString stringWithFormat:@"还没有候选。\n\n播放视频后重新打开列表。\n点右上角「诊断」可查看或复制抓取状态。\n\n%@", muse_diagnostic_report()];
         self.tableView.backgroundView = l;
     } else {
         self.tableView.backgroundView = nil;
@@ -568,7 +1109,7 @@ static NSArray<MuseCandidate *> *cand_snapshot(void) {
         NSArray<MuseCandidate *> *snap = cand_snapshot();
         if (idx.row < (NSInteger)snap.count) {
             MuseCandidate *c = snap[idx.row];
-            [gLock lock]; [gCands removeObject:c]; [gLock unlock];
+            [gLock lock]; [gCands removeObject:c]; [gSeen removeObjectForKey:c.url]; [gLock unlock];
         }
         [tv deleteRowsAtIndexPaths:@[idx] withRowAnimation:UITableViewRowAnimationAutomatic];
         done(YES);
@@ -707,794 +1248,204 @@ static NSArray<MuseCandidate *> *cand_snapshot(void) {
 
 @end
 
-// ───────────────────────── 流量抓取 ─────────────────────────
-// HTTP capture state is owned by the caller's serial capture queue.
-#include <zlib.h>
-#include <errno.h>
-#include <limits.h>
-#include <stdlib.h>
-#include <string.h>
-#include <strings.h>
+// ───────────────────────── 播放器抓取 ─────────────────────────
+static dispatch_queue_t gMediaCaptureQueue;
+static _Atomic(NSUInteger) gMediaHooksInstalled;
+static _Atomic(NSUInteger) gMediaCallsObserved;
+static _Atomic(NSUInteger) gMediaURLsObserved;
+static NSString *gMediaLastEvent;
+static NSString *gMediaLastAddress;
+static IMP gBetterCallOriginal;
+static IMP gFSPrepareOriginal;
+static IMP gFSPlayOriginal;
+static IMP gAVReplaceOriginal;
+static IMP gAVPlayOriginal;
 
-static const NSUInteger kCaptureHeaderLimit = 64 * 1024;
-static const NSUInteger kCaptureBodyLimit = 2 * 1024 * 1024;
-static const NSUInteger kCaptureDecodedLimit = 4 * 1024 * 1024;
-static const NSUInteger kCaptureRawTextLimit = 256 * 1024;
-static const NSUInteger kCaptureConnectionLimit = 32;
-static const NSUInteger kCaptureRequestLimit = 8;
-static const NSUInteger kCaptureMemoryLimit = 8 * 1024 * 1024;
-static NSUInteger gCaptureHttpMessages = 0;
-
-typedef NS_ENUM(NSUInteger, MuseCaptureBodyMode) {
-    MuseCaptureHeaders,
-    MuseCaptureLengthBody,
-    MuseCaptureChunkedBody,
-    MuseCaptureCloseBody
-};
-
-@interface MuseCaptureStream : NSObject {
-@public
-    NSMutableData *buffer;
-    NSMutableData *body;
-    NSDictionary<NSString *, NSString *> *headers;
-    NSString *url;
-    MuseCaptureBodyMode mode;
-    NSUInteger remaining;
-    NSUInteger chunkRemaining;
-    BOOL needsChunkCRLF;
-    BOOL trailers;
-    BOOL discardBody;
-    BOOL unframed;
+static void muse_record_player_call(NSString *event) {
+    atomic_fetch_add(&gMediaCallsObserved, 1);
+    if (gMediaCaptureQueue)
+        dispatch_async(gMediaCaptureQueue, ^{ gMediaLastEvent = event; });
 }
-@end
 
-@implementation MuseCaptureStream
-- (instancetype)init {
-    if ((self = [super init])) {
-        buffer = [NSMutableData data];
-        body = [NSMutableData data];
+static id muse_object_property(id object, SEL selector) {
+    if (!object || ![object respondsToSelector:selector]) return nil;
+    Method method = class_getInstanceMethod(object_getClass(object), selector);
+    if (!method || method_getNumberOfArguments(method) != 2) return nil;
+    char *type = method_copyReturnType(method);
+    BOOL objectResult = type && type[0] == '@';
+    free(type);
+    if (!objectResult) return nil;
+    return ((id (*)(id, SEL))objc_msgSend)(object, selector);
+}
+
+static NSDictionary *muse_media_headers(id value) {
+    if (![value isKindOfClass:[NSDictionary class]]) return nil;
+    NSMutableDictionary *headers = [NSMutableDictionary dictionary];
+    for (id key in value) {
+        id field = value[key];
+        if ([key isKindOfClass:[NSString class]] && [field isKindOfClass:[NSString class]] &&
+            [key rangeOfCharacterFromSet:NSCharacterSet.newlineCharacterSet].location == NSNotFound &&
+            [field rangeOfCharacterFromSet:NSCharacterSet.newlineCharacterSet].location == NSNotFound) {
+            headers[key] = field;
+        }
     }
-    return self;
-}
-@end
-
-@interface MuseCaptureConnection : NSObject {
-@public
-    MuseCaptureStream *reading;
-    MuseCaptureStream *writing;
-    NSMutableArray<NSDictionary *> *readingRequests;
-    NSMutableArray<NSDictionary *> *writingRequests;
-    NSUInteger lastUse;
-}
-@end
-
-@implementation MuseCaptureConnection
-- (instancetype)init {
-    if ((self = [super init])) {
-        reading = [MuseCaptureStream new];
-        writing = [MuseCaptureStream new];
-        readingRequests = [NSMutableArray array];
-        writingRequests = [NSMutableArray array];
-    }
-    return self;
-}
-@end
-
-static NSMutableDictionary<NSNumber *, MuseCaptureConnection *> *gCaptureConnections;
-static NSUInteger gCaptureUseSequence;
-
-static NSRange muse_capture_find(NSData *data, const char *needle, NSUInteger length) {
-    return [data rangeOfData:[NSData dataWithBytes:needle length:length]
-                    options:0 range:NSMakeRange(0, data.length)];
+    return headers.count ? [headers copy] : nil;
 }
 
-static void muse_capture_consume(NSMutableData *data, NSUInteger length) {
-    [data replaceBytesInRange:NSMakeRange(0, length) withBytes:NULL length:0];
-}
-
-static BOOL muse_capture_http_prefix(NSData *data) {
-    static const char *prefixes[] = {
-        "HTTP/1.", "GET ", "POST ", "HEAD ", "PUT ", "PATCH ",
-        "DELETE ", "OPTIONS ", "CONNECT ", "TRACE "
-    };
-    for (NSUInteger i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
-        NSUInteger length = MIN(data.length, strlen(prefixes[i]));
-        if (length && memcmp(data.bytes, prefixes[i], length) == 0) return YES;
-    }
-    return NO;
-}
-
-static BOOL muse_capture_text_prefix(NSData *data) {
-    const unsigned char *bytes = data.bytes;
-    NSUInteger offset = 0;
-    while (offset < data.length &&
-           (bytes[offset] == ' ' || bytes[offset] == '\r' ||
-            bytes[offset] == '\n' || bytes[offset] == '\t')) offset++;
-    if (offset == data.length) return YES;
-    unsigned char first = bytes[offset];
-    if (first == '{' || first == '[' || first == '"' || first == '<' || first == '#') return YES;
-    static const char *prefixes[] = {"http://", "https://"};
-    for (NSUInteger i = 0; i < 2; i++) {
-        NSUInteger length = MIN(data.length - offset, strlen(prefixes[i]));
-        if (strncasecmp((const char *)bytes + offset, prefixes[i], length) == 0) return YES;
-    }
-    return NO;
-}
-
-static BOOL muse_capture_valid_url(NSString *value) {
-    if (value.length == 0 || value.length > 8192) return NO;
-    NSURLComponents *parts = [NSURLComponents componentsWithString:value];
+static void muse_record_media(id value, NSString *title, NSDictionary *headers, NSString *origin) {
+    if (!gReady || !gMediaCaptureQueue) return;
+    NSString *url = [value isKindOfClass:[NSURL class]] ? [value absoluteString] : value;
+    if (![url isKindOfClass:[NSString class]] || !url.length || url.length > 8192) return;
+    NSURLComponents *parts = [NSURLComponents componentsWithString:url];
     NSString *scheme = parts.scheme.lowercaseString;
-    return parts.host.length && ([scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"]);
-}
-
-static BOOL muse_capture_hls_url(NSString *value) {
-    if (!muse_capture_valid_url(value)) return NO;
-    NSURLComponents *parts = [NSURLComponents componentsWithString:value];
-    NSString *filename = [parts.percentEncodedPath.lastPathComponent componentsSeparatedByString:@";"].firstObject;
-    return [filename.pathExtension.lowercaseString isEqualToString:@"m3u8"];
-}
-
-static NSString *muse_capture_inner_url(NSString *value) {
-    if (!muse_capture_valid_url(value)) return nil;
-    NSURLComponents *parts = [NSURLComponents componentsWithString:value];
-    NSString *host = parts.host.lowercaseString;
-    BOOL loopback = [host isEqualToString:@"localhost"] || [host isEqualToString:@"127.0.0.1"] ||
-                    [host isEqualToString:@"::1"] || [host isEqualToString:@"[::1]"];
-    if (!loopback || ![parts.path isEqualToString:@"/parse"]) return nil;
-    for (NSURLQueryItem *item in parts.queryItems) {
-        // queryItems decodes the outer query once and preserves literal '+'.
-        if ([item.name isEqualToString:@"url"] && muse_capture_valid_url(item.value)) return item.value;
-    }
-    return nil;
-}
-
-static void muse_capture_url(NSString *value, NSString *title) {
-    if (muse_capture_hls_url(value)) add_candidate(value, title);
-    NSString *inner = muse_capture_inner_url(value);
-    if (muse_capture_hls_url(inner)) add_candidate(inner, title);
-}
-
-static NSString *muse_capture_decode_json_string(NSString *token) {
-    id decoded = [NSJSONSerialization JSONObjectWithData:[token dataUsingEncoding:NSUTF8StringEncoding]
-                                                options:NSJSONReadingFragmentsAllowed error:NULL];
-    return [decoded isKindOfClass:[NSString class]] ? decoded : nil;
-}
-
-static BOOL muse_capture_inside_quote(NSString *text, NSUInteger location) {
-    BOOL quoted = NO;
-    BOOL escaped = NO;
-    for (NSUInteger index = 0; index < location; index++) {
-        unichar character = [text characterAtIndex:index];
-        if (escaped) escaped = NO;
-        else if (character == '\\') escaped = YES;
-        else if (character == '"') quoted = !quoted;
-    }
-    return quoted;
-}
-
-static void muse_capture_scan_text(NSString *text, NSString *title, BOOL complete) {
-    if (!text.length) return;
-    static NSRegularExpression *quoted;
-    static NSRegularExpression *plainURLs;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        quoted = [NSRegularExpression regularExpressionWithPattern:@"\"(?:[^\"\\\\]|\\\\.)*\""
-                                                           options:0 error:NULL];
-        plainURLs = [NSRegularExpression regularExpressionWithPattern:@"https?://[^\\s\"'<>\\\\]+"
-                                                              options:NSRegularExpressionCaseInsensitive error:NULL];
+    if (!parts.host.length || !([scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"])) return;
+    NSString *extension = parts.path.pathExtension.lowercaseString;
+    if ([@[@"mp3", @"aac", @"wav", @"m4a", @"ogg"] containsObject:extension]) return;
+    NSString *capturedURL = [url copy];
+    NSString *capturedTitle = [title copy];
+    NSDictionary *capturedHeaders = [headers copy];
+    atomic_fetch_add(&gMediaURLsObserved, 1);
+    dispatch_async(gMediaCaptureQueue, ^{
+        @autoreleasepool {
+            gMediaLastEvent = origin;
+            gMediaLastAddress = [NSString stringWithFormat:@"%@%@", parts.host, parts.percentEncodedPath ?: @""];
+            add_candidate(capturedURL, capturedTitle, capturedHeaders);
+        }
     });
-    for (NSTextCheckingResult *match in [quoted matchesInString:text options:0 range:NSMakeRange(0, text.length)]) {
-        NSString *decoded = muse_capture_decode_json_string([text substringWithRange:match.range]);
-        if (decoded) muse_capture_url(decoded, title);
-    }
-    NSString *normalized = [text stringByReplacingOccurrencesOfString:@"\\/" withString:@"/"];
-    for (NSTextCheckingResult *match in [plainURLs matchesInString:normalized options:0
-                                                           range:NSMakeRange(0, normalized.length)]) {
-        if (muse_capture_inside_quote(normalized, match.range.location)) continue;
-        if (NSMaxRange(match.range) < normalized.length &&
-            [normalized characterAtIndex:NSMaxRange(match.range)] == '\\') continue;
-        // A URL reaching a live buffer's end may still be receiving its signature.
-        if (!complete && NSMaxRange(match.range) == normalized.length) continue;
-        muse_capture_url([normalized substringWithRange:match.range], title);
-    }
 }
 
-static void muse_capture_walk_json(id object, NSString *title, NSUInteger depth) {
-    if (depth > 32) return;
+static void muse_collect_media(id object, NSString *title, NSDictionary *headers, NSUInteger depth) {
+    if (depth > 12) return;
     if ([object isKindOfClass:[NSDictionary class]]) {
-        id ownTitle = object[@"title"];
+        id ownTitle = object[@"title"] ?: object[@"name"];
         NSString *matchingTitle = [ownTitle isKindOfClass:[NSString class]] ? ownTitle : title;
-        for (id value in [object allValues]) muse_capture_walk_json(value, matchingTitle, depth + 1);
+        NSDictionary *matchingHeaders = muse_media_headers(object[@"headers"] ?: object[@"httpHeaders"]) ?: headers;
+        for (id key in object) {
+            id value = object[key];
+            NSString *name = [key isKindOfClass:[NSString class]] ? [key lowercaseString] : @"";
+            if ([@[@"uri", @"url", @"videourl", @"source", @"src"] containsObject:name]) {
+                muse_record_media(value, matchingTitle, matchingHeaders, @"BetterPlayer 数据源");
+            }
+            if ([value isKindOfClass:[NSDictionary class]] || [value isKindOfClass:[NSArray class]])
+                muse_collect_media(value, matchingTitle, matchingHeaders, depth + 1);
+        }
     } else if ([object isKindOfClass:[NSArray class]]) {
-        for (id value in object) muse_capture_walk_json(value, title, depth + 1);
-    } else if ([object isKindOfClass:[NSString class]]) {
-        muse_capture_url(object, title);
-        muse_capture_scan_text(object, title, YES);
+        for (id value in object) muse_collect_media(value, title, headers, depth + 1);
     }
 }
 
-static NSData *muse_capture_inflate(NSData *input, int windowBits) {
-    if (!input.length || input.length > kCaptureBodyLimit) return nil;
-    z_stream stream = {0};
-    stream.next_in = (Bytef *)input.bytes;
-    stream.avail_in = (uInt)input.length;
-    if (inflateInit2(&stream, windowBits) != Z_OK) return nil;
-    NSMutableData *output = [NSMutableData data];
-    unsigned char chunk[16384];
-    int status = Z_OK;
-    while (status == Z_OK) {
-        stream.next_out = chunk;
-        stream.avail_out = sizeof(chunk);
-        status = inflate(&stream, Z_NO_FLUSH);
-        NSUInteger produced = sizeof(chunk) - stream.avail_out;
-        if (produced > kCaptureDecodedLimit - output.length) {
-            status = Z_MEM_ERROR;
-            break;
-        }
-        [output appendBytes:chunk length:produced];
-        if (status == Z_OK && produced == 0 && stream.avail_in == 0) {
-            status = Z_DATA_ERROR;
-            break;
-        }
-    }
-    inflateEnd(&stream);
-    return status == Z_STREAM_END ? output : nil;
-}
-
-static NSData *muse_capture_decode_body(NSData *body, NSString *encoding) {
-    NSString *name = [[encoding lowercaseString] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
-    if (!name.length || [name isEqualToString:@"identity"]) return body;
-    if ([name isEqualToString:@"gzip"] || [name isEqualToString:@"x-gzip"]) return muse_capture_inflate(body, 15 + 16);
-    if ([name isEqualToString:@"deflate"]) {
-        NSData *decoded = muse_capture_inflate(body, 15);
-        return decoded ?: muse_capture_inflate(body, -15);
-    }
-    return nil;
-}
-
-static void muse_capture_scan_body(NSData *encodedBody, NSDictionary *headers, NSString *requestURL) {
-    NSData *decodedBody = muse_capture_decode_body(encodedBody, headers[@"content-encoding"]);
-    if (!decodedBody.length) return;
-    id json = [NSJSONSerialization JSONObjectWithData:decodedBody options:NSJSONReadingFragmentsAllowed error:NULL];
-    if (json) {
-        muse_capture_walk_json(json, nil, 0);
-        return;
-    }
-    NSString *text = [[NSString alloc] initWithData:decodedBody encoding:NSUTF8StringEncoding];
-    if (!text) return;
-    NSString *trimmed = [text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    if ([trimmed hasPrefix:@"#EXTM3U"] && muse_capture_valid_url(requestURL)) {
-        NSString *inner = muse_capture_inner_url(requestURL);
-        // An extensionless parse/topicId endpoint is accepted only after this HLS response.
-        add_candidate(muse_capture_hls_url(inner) ? inner : requestURL, nil);
-    }
-    muse_capture_scan_text(text, nil, YES);
-}
-
-static void muse_capture_reset_message(MuseCaptureStream *stream) {
-    stream->body.length = 0;
-    stream->headers = nil;
-    stream->url = nil;
-    stream->mode = MuseCaptureHeaders;
-    stream->remaining = 0;
-    stream->chunkRemaining = 0;
-    stream->needsChunkCRLF = NO;
-    stream->trailers = NO;
-    stream->discardBody = NO;
-    stream->unframed = NO;
-}
-
-static void muse_capture_finish_message(MuseCaptureStream *stream) {
-    if (!stream->discardBody) muse_capture_scan_body(stream->body, stream->headers, stream->url);
-    gCaptureHttpMessages++;
-    muse_capture_reset_message(stream);
-}
-
-static void muse_capture_append_body(MuseCaptureStream *stream, const void *bytes, NSUInteger length) {
-    if (stream->discardBody) return;
-    if (length > kCaptureBodyLimit - stream->body.length) {
-        stream->body.length = 0;
-        stream->discardBody = YES;
-        return;
-    }
-    [stream->body appendBytes:bytes length:length];
-}
-
-static BOOL muse_capture_unsigned(NSString *value, int base, NSUInteger *result) {
-    if (!value.length) return NO;
-    const char *start = value.UTF8String;
-    if (!start || *start == '-' || *start == '+') return NO;
-    errno = 0;
-    char *end = NULL;
-    unsigned long long number = strtoull(start, &end, base);
-    if (errno || !end || end == start || *end || number > NSUIntegerMax) return NO;
-    *result = (NSUInteger)number;
-    return YES;
-}
-
-static BOOL muse_capture_begin_message(MuseCaptureConnection *connection, MuseCaptureStream *stream, BOOL reading) {
-    NSRange end = muse_capture_find(stream->buffer, "\r\n\r\n", 4);
-    if (end.location == NSNotFound) return NO;
-    NSData *headerData = [stream->buffer subdataWithRange:NSMakeRange(0, end.location)];
-    NSString *headerText = [[NSString alloc] initWithData:headerData encoding:NSISOLatin1StringEncoding];
-    NSArray<NSString *> *lines = [headerText componentsSeparatedByString:@"\r\n"];
-    NSArray<NSString *> *parts = [[lines.firstObject componentsSeparatedByString:@" "]
-                                filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"length > 0"]];
-    if (parts.count < 2) {
-        stream->buffer.length = 0;
-        return NO;
-    }
-    NSMutableDictionary *parsedHeaders = [NSMutableDictionary dictionary];
-    for (NSUInteger index = 1; index < lines.count; index++) {
-        NSRange colon = [lines[index] rangeOfString:@":"];
-        if (colon.location == NSNotFound) continue;
-        NSString *name = [[lines[index] substringToIndex:colon.location] lowercaseString];
-        NSString *value = [[lines[index] substringFromIndex:colon.location + 1]
-                           stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
-        parsedHeaders[name] = value;
-    }
-    muse_capture_consume(stream->buffer, NSMaxRange(end));
-    stream->headers = parsedHeaders;
-    BOOL response = [parts[0] hasPrefix:@"HTTP/1."];
-    BOOL noBody = NO;
-    if (response) {
-        NSInteger status = [parts[1] integerValue];
-        NSMutableArray *requests = reading ? connection->readingRequests : connection->writingRequests;
-        NSDictionary *request = requests.firstObject;
-        stream->url = request[@"url"];
-        BOOL informational = status >= 100 && status < 200;
-        noBody = informational || status == 204 || status == 304 || [request[@"method"] isEqualToString:@"HEAD"] ||
-                 ([request[@"method"] isEqualToString:@"CONNECT"] && status >= 200 && status < 300);
-        if (!informational && requests.count) [requests removeObjectAtIndex:0];
-        NSString *location = parsedHeaders[@"location"];
-        if (location.length) {
-            NSURL *base = stream->url.length ? [NSURL URLWithString:stream->url] : nil;
-            NSString *redirect = [NSURL URLWithString:location relativeToURL:base].absoluteString;
-            muse_capture_url(redirect, nil);
-        }
-    } else {
-        NSString *target = parts[1];
-        NSString *host = parsedHeaders[@"host"];
-        if (muse_capture_valid_url(target)) stream->url = target;
-        else if ([target hasPrefix:@"/"] && host.length) stream->url = [NSString stringWithFormat:@"http://%@%@", host, target];
-        if (!muse_capture_valid_url(stream->url)) stream->url = nil;
-        NSMutableArray *requests = reading ? connection->writingRequests : connection->readingRequests;
-        if (requests.count >= kCaptureRequestLimit) [requests removeObjectAtIndex:0];
-        [requests addObject:@{@"url": stream->url ?: @"", @"method": parts[0]}];
-        muse_capture_url(stream->url, nil);
-    }
-    NSString *transfer = [parsedHeaders[@"transfer-encoding"] lowercaseString];
-    NSUInteger length = 0;
-    if (noBody) {
-        muse_capture_finish_message(stream);
-    } else if (transfer.length && [transfer rangeOfString:@"chunked"].location != NSNotFound) {
-        stream->mode = MuseCaptureChunkedBody;
-    } else if (parsedHeaders[@"content-length"]) {
-        if (!muse_capture_unsigned(parsedHeaders[@"content-length"], 10, &length)) {
-            stream->buffer.length = 0;
-            muse_capture_reset_message(stream);
-            return NO;
-        }
-        stream->remaining = length;
-        stream->mode = MuseCaptureLengthBody;
-        if (!length) muse_capture_finish_message(stream);
-    } else if (response) {
-        stream->mode = MuseCaptureCloseBody;
-    } else {
-        muse_capture_finish_message(stream);
-    }
-    return YES;
-}
-
-static void muse_capture_raw_text(MuseCaptureStream *stream, BOOL complete) {
-    NSString *text = [[NSString alloc] initWithData:stream->buffer encoding:NSUTF8StringEncoding];
-    if (!text) return;
-    id json = [NSJSONSerialization JSONObjectWithData:stream->buffer options:NSJSONReadingFragmentsAllowed error:NULL];
-    if (json) {
-        muse_capture_walk_json(json, nil, 0);
-        stream->buffer.length = 0;
-        stream->unframed = NO;
-    } else {
-        NSString *trimmed = [text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        if (!complete && ([trimmed hasPrefix:@"{"] || [trimmed hasPrefix:@"["])) return;
-        muse_capture_scan_text(text, nil, complete);
-    }
-}
-
-static void muse_capture_process(MuseCaptureConnection *connection, MuseCaptureStream *stream, BOOL reading) {
-    while (stream->buffer.length) {
-        if (stream->mode == MuseCaptureHeaders) {
-            if (stream->unframed || !muse_capture_http_prefix(stream->buffer)) {
-                if (!stream->unframed && !muse_capture_text_prefix(stream->buffer)) {
-                    stream->buffer.length = 0;
-                    return;
-                }
-                stream->unframed = YES;
-                muse_capture_raw_text(stream, NO);
-                if (stream->buffer.length > kCaptureRawTextLimit) {
-                    muse_capture_consume(stream->buffer, stream->buffer.length - 8192);
-                }
-                return;
-            }
-            NSRange headerEnd = muse_capture_find(stream->buffer, "\r\n\r\n", 4);
-            if (headerEnd.location == NSNotFound) {
-                if (stream->buffer.length > kCaptureHeaderLimit) stream->buffer.length = 0;
-                return;
-            }
-            if (NSMaxRange(headerEnd) > kCaptureHeaderLimit) {
-                stream->buffer.length = 0;
-                return;
-            }
-            if (!muse_capture_begin_message(connection, stream, reading)) return;
-        } else if (stream->mode == MuseCaptureLengthBody) {
-            NSUInteger count = MIN(stream->remaining, stream->buffer.length);
-            muse_capture_append_body(stream, stream->buffer.bytes, count);
-            muse_capture_consume(stream->buffer, count);
-            stream->remaining -= count;
-            if (!stream->remaining) muse_capture_finish_message(stream);
-        } else if (stream->mode == MuseCaptureCloseBody) {
-            muse_capture_append_body(stream, stream->buffer.bytes, stream->buffer.length);
-            stream->buffer.length = 0;
-        } else if (stream->trailers) {
-            if (stream->buffer.length >= 2 && memcmp(stream->buffer.bytes, "\r\n", 2) == 0) {
-                muse_capture_consume(stream->buffer, 2);
-                muse_capture_finish_message(stream);
-                continue;
-            }
-            NSRange end = muse_capture_find(stream->buffer, "\r\n\r\n", 4);
-            if (end.location == NSNotFound) {
-                if (stream->buffer.length > kCaptureHeaderLimit) {
-                    stream->buffer.length = 0;
-                    muse_capture_reset_message(stream);
-                }
-                return;
-            }
-            muse_capture_consume(stream->buffer, NSMaxRange(end));
-            muse_capture_finish_message(stream);
-        } else if (stream->needsChunkCRLF) {
-            if (stream->buffer.length < 2) return;
-            if (memcmp(stream->buffer.bytes, "\r\n", 2) != 0) {
-                stream->buffer.length = 0;
-                muse_capture_reset_message(stream);
-                return;
-            }
-            muse_capture_consume(stream->buffer, 2);
-            stream->needsChunkCRLF = NO;
-        } else if (stream->chunkRemaining) {
-            NSUInteger count = MIN(stream->chunkRemaining, stream->buffer.length);
-            muse_capture_append_body(stream, stream->buffer.bytes, count);
-            muse_capture_consume(stream->buffer, count);
-            stream->chunkRemaining -= count;
-            if (!stream->chunkRemaining) stream->needsChunkCRLF = YES;
-        } else {
-            NSRange end = muse_capture_find(stream->buffer, "\r\n", 2);
-            if (end.location == NSNotFound) {
-                if (stream->buffer.length > 4096) {
-                    stream->buffer.length = 0;
-                    muse_capture_reset_message(stream);
-                }
-                return;
-            }
-            NSString *line = [[NSString alloc] initWithData:[stream->buffer subdataWithRange:NSMakeRange(0, end.location)]
-                                                  encoding:NSASCIIStringEncoding];
-            NSString *size = [[line componentsSeparatedByString:@";"].firstObject
-                              stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
-            NSUInteger chunkSize = 0;
-            if (!muse_capture_unsigned(size, 16, &chunkSize)) {
-                stream->buffer.length = 0;
-                muse_capture_reset_message(stream);
-                return;
-            }
-            muse_capture_consume(stream->buffer, NSMaxRange(end));
-            stream->chunkRemaining = chunkSize;
-            if (!chunkSize) stream->trailers = YES;
-        }
-    }
-}
-
-static NSUInteger muse_capture_memory(MuseCaptureConnection *connection) {
-    return connection->reading->buffer.length + connection->reading->body.length +
-           connection->writing->buffer.length + connection->writing->body.length;
-}
-
-static void muse_capture_trim(NSNumber *keepKey) {
-    NSUInteger bytes = 0;
-    for (MuseCaptureConnection *connection in gCaptureConnections.allValues) bytes += muse_capture_memory(connection);
-    while (gCaptureConnections.count > kCaptureConnectionLimit || bytes > kCaptureMemoryLimit) {
-        NSNumber *oldestKey = nil;
-        NSUInteger oldestUse = NSUIntegerMax;
-        for (NSNumber *key in gCaptureConnections) {
-            MuseCaptureConnection *connection = gCaptureConnections[key];
-            if (![key isEqual:keepKey] && connection->lastUse < oldestUse) {
-                oldestKey = key;
-                oldestUse = connection->lastUse;
-            }
-        }
-        if (!oldestKey) break;
-        bytes -= muse_capture_memory(gCaptureConnections[oldestKey]);
-        [gCaptureConnections removeObjectForKey:oldestKey];
-    }
-}
-
-static void muse_capture_feed(int fd, NSData *data, BOOL reading) {
-    if (fd < 0 || !data.length) return;
-    @autoreleasepool {
-        if (!gCaptureConnections) gCaptureConnections = [NSMutableDictionary dictionary];
-        NSNumber *key = @(fd);
-        MuseCaptureConnection *connection = gCaptureConnections[key];
-        if (!connection) {
-            connection = [MuseCaptureConnection new];
-            gCaptureConnections[key] = connection;
-        }
-        connection->lastUse = ++gCaptureUseSequence;
-        MuseCaptureStream *stream = reading ? connection->reading : connection->writing;
-        const unsigned char *bytes = data.bytes;
-        for (NSUInteger offset = 0; offset < data.length;) {
-            NSUInteger count = MIN((NSUInteger)16384, data.length - offset);
-            NSData *piece = [NSData dataWithBytesNoCopy:(void *)(bytes + offset) length:count freeWhenDone:NO];
-            if (stream->mode != MuseCaptureHeaders || stream->buffer.length ||
-                muse_capture_http_prefix(piece) || muse_capture_text_prefix(piece)) {
-                [stream->buffer appendBytes:bytes + offset length:count];
-                muse_capture_process(connection, stream, reading);
-            }
-            offset += count;
-        }
-        muse_capture_trim(key);
-    }
-}
-
-static void muse_capture_close(int fd) {
-    @autoreleasepool {
-        NSNumber *key = @(fd);
-        MuseCaptureConnection *connection = gCaptureConnections[key];
-        if (!connection) return;
-        for (MuseCaptureStream *stream in @[connection->reading, connection->writing]) {
-            if (stream->mode == MuseCaptureCloseBody) muse_capture_finish_message(stream);
-            else if (stream->unframed) muse_capture_raw_text(stream, YES);
-        }
-        [gCaptureConnections removeObjectForKey:key];
-    }
-}
-
-// ───────────────────────── 网络调用 ─────────────────────────
-enum {
-    MuseIoRead, MuseIoWrite, MuseIoRecv, MuseIoRecvFrom,
-    MuseIoRecvMsg, MuseIoSend, MuseIoSendTo, MuseIoSendMsg, MuseIoCount
-};
-static _Atomic(unsigned long long) gCaptureIoCalls[MuseIoCount];
-static _Atomic(size_t) gCaptureQueuedBytes;
-static __thread unsigned int gCaptureDepth;
-static dispatch_queue_t gCaptureQueue;
-static dispatch_source_t gCaptureTimer;
-static const size_t kCaptureQueueBudget = 8 * 1024 * 1024;
-
-static void muse_capture_vectors(int fd, const struct iovec *vectors, size_t count,
-                                 size_t length, BOOL reading) {
-    if (!length || length > kCaptureQueueBudget || !vectors || !gCaptureQueue) return;
-    int type = 0;
-    socklen_t typeLength = sizeof(type);
-    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &typeLength) != 0 || type != SOCK_STREAM) return;
-    size_t queued = atomic_fetch_add(&gCaptureQueuedBytes, length);
-    if (queued > kCaptureQueueBudget - length) {
-        atomic_fetch_sub(&gCaptureQueuedBytes, length);
-        return;
-    }
+static void muse_better_call(id object, SEL selector, id call, id result) {
     @try {
-        @autoreleasepool {
-            NSMutableData *data = [NSMutableData dataWithCapacity:length];
-            size_t remaining = length;
-            for (size_t i = 0; i < count && remaining; i++) {
-                size_t part = MIN(vectors[i].iov_len, remaining);
-                if (part) [data appendBytes:vectors[i].iov_base length:part];
-                remaining -= part;
-            }
-            if (remaining) {
-                atomic_fetch_sub(&gCaptureQueuedBytes, length);
-                return;
-            }
-            dispatch_async(gCaptureQueue, ^{
-                @autoreleasepool {
-                    gCaptureDepth++;
-                    @try {
-                        muse_capture_feed(fd, data, reading);
-                    } @catch (NSException *exception) {
-                        muse_capture_close(fd);
-                        mlog(@"抓取解析异常: %@", exception.name);
-                    } @finally {
-                        gCaptureDepth--;
-                        atomic_fetch_sub(&gCaptureQueuedBytes, length);
-                    }
-                }
-            });
+        NSString *method = muse_object_property(call, NSSelectorFromString(@"method"));
+        NSString *lower = method.lowercaseString;
+        muse_record_player_call([NSString stringWithFormat:@"BetterPlayer %@", method ?: @"未知方法"]);
+        if ([lower containsString:@"datasource"] || [lower isEqualToString:@"create"]) {
+            id arguments = muse_object_property(call, NSSelectorFromString(@"arguments"));
+            muse_collect_media(arguments, nil, nil, 0);
         }
-    } @catch (__unused NSException *exception) {
-        atomic_fetch_sub(&gCaptureQueuedBytes, length);
+    } @catch (__unused NSException *exception) {}
+    ((void (*)(id, SEL, id, id))gBetterCallOriginal)(object, selector, call, result);
+}
+
+static void muse_fs_prepare(id object, SEL selector) {
+    @try {
+        muse_record_player_call(@"FSPlayer 准备播放");
+        muse_record_media(muse_object_property(object, NSSelectorFromString(@"contentURL")), nil, nil, @"FSPlayer 准备播放");
+    } @catch (__unused NSException *exception) {}
+    ((void (*)(id, SEL))gFSPrepareOriginal)(object, selector);
+}
+
+static void muse_fs_play(id object, SEL selector) {
+    @try {
+        muse_record_player_call(@"FSPlayer 播放");
+        muse_record_media(muse_object_property(object, NSSelectorFromString(@"contentURL")), nil, nil, @"FSPlayer 播放");
+    } @catch (__unused NSException *exception) {}
+    ((void (*)(id, SEL))gFSPlayOriginal)(object, selector);
+}
+
+static void muse_capture_av_item(id item, NSString *origin) {
+    id asset = muse_object_property(item, NSSelectorFromString(@"asset"));
+    id url = muse_object_property(asset, NSSelectorFromString(@"URL"));
+    muse_record_media(url, nil, nil, origin);
+}
+
+static void muse_av_replace(id object, SEL selector, id item) {
+    @try {
+        muse_record_player_call(@"AVPlayer 更换数据源");
+        muse_capture_av_item(item, @"AVPlayer 更换数据源");
+    } @catch (__unused NSException *exception) {}
+    ((void (*)(id, SEL, id))gAVReplaceOriginal)(object, selector, item);
+}
+
+static void muse_av_play(id object, SEL selector) {
+    @try {
+        muse_record_player_call(@"AVPlayer 播放");
+        id item = muse_object_property(object, NSSelectorFromString(@"currentItem"));
+        muse_capture_av_item(item, @"AVPlayer 播放");
+    } @catch (__unused NSException *exception) {}
+    ((void (*)(id, SEL))gAVPlayOriginal)(object, selector);
+}
+
+static BOOL muse_install_media_hook(NSString *name, NSString *methodName, unsigned int arguments,
+                                    char resultType, IMP replacement, IMP *original) {
+    if (*original) return YES;
+    Class cls = NSClassFromString(name);
+    SEL selector = NSSelectorFromString(methodName);
+    Method method = class_getInstanceMethod(cls, selector);
+    if (!method || method_getNumberOfArguments(method) != arguments) return NO;
+    char *type = method_copyReturnType(method);
+    BOOL valid = type && type[0] == resultType;
+    free(type);
+    for (unsigned int index = 2; valid && index < arguments; index++) {
+        char *argument = method_copyArgumentType(method, index);
+        valid = argument && argument[0] == '@';
+        free(argument);
     }
+    if (!valid) return NO;
+    *original = method_getImplementation(method);
+    class_replaceMethod(cls, selector, replacement, method_getTypeEncoding(method));
+    return YES;
 }
 
-static void muse_capture_bytes(int fd, const void *bytes, size_t length, BOOL reading) {
-    struct iovec vector = { .iov_base = (void *)bytes, .iov_len = length };
-    muse_capture_vectors(fd, &vector, 1, length, reading);
-}
-
-static void muse_capture_start(void) {
-    gCaptureQueue = dispatch_queue_create("MuseHook.capture", DISPATCH_QUEUE_SERIAL);
-    gCaptureTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, gCaptureQueue);
-    dispatch_source_set_timer(gCaptureTimer, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC),
-                              10 * NSEC_PER_SEC, NSEC_PER_SEC);
-    dispatch_source_set_event_handler(gCaptureTimer, ^{
-        @autoreleasepool {
-            gCaptureDepth++;
-            [gLock lock];
-            NSUInteger candidates = gCands.count;
-            [gLock unlock];
-            mlog(@"网络抓取 read=%llu write=%llu recv=%llu recvfrom=%llu recvmsg=%llu "
-                  "send=%llu sendto=%llu sendmsg=%llu HTTP=%lu 候选=%lu",
-                 atomic_load(&gCaptureIoCalls[MuseIoRead]), atomic_load(&gCaptureIoCalls[MuseIoWrite]),
-                 atomic_load(&gCaptureIoCalls[MuseIoRecv]), atomic_load(&gCaptureIoCalls[MuseIoRecvFrom]),
-                 atomic_load(&gCaptureIoCalls[MuseIoRecvMsg]), atomic_load(&gCaptureIoCalls[MuseIoSend]),
-                 atomic_load(&gCaptureIoCalls[MuseIoSendTo]), atomic_load(&gCaptureIoCalls[MuseIoSendMsg]),
-                 (unsigned long)gCaptureHttpMessages, (unsigned long)candidates);
-            gCaptureDepth--;
-        }
-    });
-    dispatch_resume(gCaptureTimer);
-}
-
-// 同一 dylib 内的原始符号调用由 dyld 保留，深度计数处理 libSystem 内部的嵌套调用。
-static ssize_t my_read(int fd, void *buffer, size_t length) {
-    if (!gReady) return read(fd, buffer, length);
-    BOOL outer = ++gCaptureDepth == 1;
-    ssize_t result = read(fd, buffer, length);
-    int savedErrno = errno;
-    if (outer) {
-        atomic_fetch_add(&gCaptureIoCalls[MuseIoRead], 1);
-        if (result > 0) muse_capture_bytes(fd, buffer, (size_t)result, YES);
-    }
-    gCaptureDepth--;
-    errno = savedErrno;
-    return result;
-}
-
-static ssize_t my_write(int fd, const void *buffer, size_t length) {
-    if (!gReady) return write(fd, buffer, length);
-    BOOL outer = ++gCaptureDepth == 1;
-    ssize_t result = write(fd, buffer, length);
-    int savedErrno = errno;
-    if (outer) {
-        atomic_fetch_add(&gCaptureIoCalls[MuseIoWrite], 1);
-        if (result > 0) muse_capture_bytes(fd, buffer, (size_t)result, NO);
-    }
-    gCaptureDepth--;
-    errno = savedErrno;
-    return result;
-}
-
-static ssize_t my_recv(int fd, void *buffer, size_t length, int flags) {
-    if (!gReady) return recv(fd, buffer, length, flags);
-    BOOL outer = ++gCaptureDepth == 1;
-    ssize_t result = recv(fd, buffer, length, flags);
-    int savedErrno = errno;
-    if (outer) {
-        atomic_fetch_add(&gCaptureIoCalls[MuseIoRecv], 1);
-        if (result > 0 && !(flags & MSG_PEEK)) muse_capture_bytes(fd, buffer, (size_t)result, YES);
-    }
-    gCaptureDepth--;
-    errno = savedErrno;
-    return result;
-}
-
-static ssize_t my_recvfrom(int fd, void *buffer, size_t length, int flags,
-                           struct sockaddr *address, socklen_t *addressLength) {
-    if (!gReady) return recvfrom(fd, buffer, length, flags, address, addressLength);
-    BOOL outer = ++gCaptureDepth == 1;
-    ssize_t result = recvfrom(fd, buffer, length, flags, address, addressLength);
-    int savedErrno = errno;
-    if (outer) {
-        atomic_fetch_add(&gCaptureIoCalls[MuseIoRecvFrom], 1);
-        if (result > 0 && !(flags & MSG_PEEK)) muse_capture_bytes(fd, buffer, (size_t)result, YES);
-    }
-    gCaptureDepth--;
-    errno = savedErrno;
-    return result;
-}
-
-static ssize_t my_recvmsg(int fd, struct msghdr *message, int flags) {
-    if (!gReady) return recvmsg(fd, message, flags);
-    BOOL outer = ++gCaptureDepth == 1;
-    ssize_t result = recvmsg(fd, message, flags);
-    int savedErrno = errno;
-    if (outer) {
-        atomic_fetch_add(&gCaptureIoCalls[MuseIoRecvMsg], 1);
-        if (result > 0 && !(flags & MSG_PEEK))
-            muse_capture_vectors(fd, message->msg_iov, (size_t)message->msg_iovlen, (size_t)result, YES);
-    }
-    gCaptureDepth--;
-    errno = savedErrno;
-    return result;
-}
-
-static ssize_t my_send(int fd, const void *buffer, size_t length, int flags) {
-    if (!gReady) return send(fd, buffer, length, flags);
-    BOOL outer = ++gCaptureDepth == 1;
-    ssize_t result = send(fd, buffer, length, flags);
-    int savedErrno = errno;
-    if (outer) {
-        atomic_fetch_add(&gCaptureIoCalls[MuseIoSend], 1);
-        if (result > 0) muse_capture_bytes(fd, buffer, (size_t)result, NO);
-    }
-    gCaptureDepth--;
-    errno = savedErrno;
-    return result;
-}
-
-static ssize_t my_sendto(int fd, const void *buffer, size_t length, int flags,
-                         const struct sockaddr *address, socklen_t addressLength) {
-    if (!gReady) return sendto(fd, buffer, length, flags, address, addressLength);
-    BOOL outer = ++gCaptureDepth == 1;
-    ssize_t result = sendto(fd, buffer, length, flags, address, addressLength);
-    int savedErrno = errno;
-    if (outer) {
-        atomic_fetch_add(&gCaptureIoCalls[MuseIoSendTo], 1);
-        if (result > 0) muse_capture_bytes(fd, buffer, (size_t)result, NO);
-    }
-    gCaptureDepth--;
-    errno = savedErrno;
-    return result;
-}
-
-static ssize_t my_sendmsg(int fd, const struct msghdr *message, int flags) {
-    if (!gReady) return sendmsg(fd, message, flags);
-    BOOL outer = ++gCaptureDepth == 1;
-    ssize_t result = sendmsg(fd, message, flags);
-    int savedErrno = errno;
-    if (outer) {
-        atomic_fetch_add(&gCaptureIoCalls[MuseIoSendMsg], 1);
-        if (result > 0)
-            muse_capture_vectors(fd, message->msg_iov, (size_t)message->msg_iovlen, (size_t)result, NO);
-    }
-    gCaptureDepth--;
-    errno = savedErrno;
-    return result;
-}
-
-static int my_close(int fd) {
-    if (!gReady) return close(fd);
-    BOOL outer = ++gCaptureDepth == 1;
-    int result = close(fd);
-    int savedErrno = errno;
-    if (outer && result == 0 && gCaptureQueue)
-        dispatch_async(gCaptureQueue, ^{
-            @autoreleasepool {
-                gCaptureDepth++;
-                @try { muse_capture_close(fd); }
-                @catch (__unused NSException *exception) {}
-                gCaptureDepth--;
-            }
+static void muse_media_install_hooks(NSUInteger retry) {
+    NSUInteger installed = 0;
+    installed += muse_install_media_hook(@"_TtC18better_player_plus18BetterPlayerPlugin", @"handleMethodCall:result:",
+                                        4, 'v', (IMP)muse_better_call, &gBetterCallOriginal);
+    installed += muse_install_media_hook(@"FSPlayer", @"prepareToPlay",
+                                        2, 'v', (IMP)muse_fs_prepare, &gFSPrepareOriginal);
+    installed += muse_install_media_hook(@"FSPlayer", @"play", 2, 'v', (IMP)muse_fs_play, &gFSPlayOriginal);
+    installed += muse_install_media_hook(@"AVPlayer", @"replaceCurrentItemWithPlayerItem:",
+                                        3, 'v', (IMP)muse_av_replace, &gAVReplaceOriginal);
+    installed += muse_install_media_hook(@"AVPlayer", @"play", 2, 'v', (IMP)muse_av_play, &gAVPlayOriginal);
+    atomic_store(&gMediaHooksInstalled, installed);
+    if (installed < 5 && retry < 5)
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            muse_media_install_hooks(retry + 1);
         });
-    gCaptureDepth--;
-    errno = savedErrno;
-    return result;
 }
 
-#define DYLD_INTERPOSE(_replacement, _replacee)                                   \
-    __attribute__((used)) static struct {                                         \
-        const void *replacement;                                                  \
-        const void *replacee;                                                     \
-    } _interpose_##_replacee __attribute__((section("__DATA,__interpose"))) = {     \
-        (const void *)(unsigned long)&_replacement,                               \
-        (const void *)(unsigned long)&_replacee};
+static void muse_media_capture_start(void) {
+    gMediaCaptureQueue = dispatch_queue_create("MuseHook.media", DISPATCH_QUEUE_SERIAL);
+    muse_media_install_hooks(0);
+}
 
-DYLD_INTERPOSE(my_read, read)
-DYLD_INTERPOSE(my_write, write)
-DYLD_INTERPOSE(my_recv, recv)
-DYLD_INTERPOSE(my_recvfrom, recvfrom)
-DYLD_INTERPOSE(my_recvmsg, recvmsg)
-DYLD_INTERPOSE(my_send, send)
-DYLD_INTERPOSE(my_sendto, sendto)
-DYLD_INTERPOSE(my_sendmsg, sendmsg)
-DYLD_INTERPOSE(my_close, close)
+static NSString *muse_diagnostic_report(void) {
+    __block NSString *event = nil;
+    __block NSString *address = nil;
+    if (gMediaCaptureQueue) {
+        dispatch_sync(gMediaCaptureQueue, ^{
+            event = gMediaLastEvent;
+            address = gMediaLastAddress;
+        });
+    }
+    NSString *logPath = gLogPath ?: [out_dir() stringByAppendingPathComponent:@"hook.log"];
+    return [NSString stringWithFormat:
+        @"MuseHook 播放器抓取版\n观察点 %lu/5\n播放器调用 %lu\n播放地址 %lu\n最近入口 %@\n最近地址 %@\n日志 %@",
+        (unsigned long)atomic_load(&gMediaHooksInstalled),
+        (unsigned long)atomic_load(&gMediaCallsObserved),
+        (unsigned long)atomic_load(&gMediaURLsObserved),
+        event ?: @"等待播放", address ?: @"等待播放", logPath];
+}
 
 // ───────────────────────── 入口 ─────────────────────────
 // constructor 里只做一件事：把初始化丢到主队列延后执行。
@@ -1510,8 +1461,8 @@ static void muse_bootstrap(void) {
         gSeen = [NSMutableDictionary dictionary];
         gUnseen = 0;
         (void)out_dir();
-        muse_capture_start();
-        mlog(@"MuseHook 已注入（网络抓取更新）· 输出: %@", out_dir());
+        muse_media_capture_start();
+        mlog(@"MuseHook 已注入（播放器抓取版）· 输出: %@", out_dir());
         gReady = YES;
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
