@@ -1,0 +1,49 @@
+name: build-musehook-dylib
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Build dylib (arm64)
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -isysroot "$SDK" \
+            -fobjc-arc \
+            -dynamiclib \
+            -O2 \
+            -framework Foundation \
+            -framework UIKit \
+            -framework CoreFoundation \
+            -o MuseHook.dylib \
+            MuseHook.m
+          ls -lh MuseHook.dylib
+          file MuseHook.dylib
+
+      - name: Ad-hoc sign
+        run: |
+          brew install ldid >/dev/null 2>&1 || true
+          ldid -S MuseHook.dylib || echo "ldid failed, TrollFools 会自己签"
+          otool -L MuseHook.dylib || true
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: MuseHook-dylib
+          path: MuseHook.dylib
+          retention-days: 30
