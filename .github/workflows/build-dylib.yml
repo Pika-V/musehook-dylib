@@ -17,6 +17,471 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
 
+      - name: Test capture parser and native hooks
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          parser_tests = r'''
+          #import <Foundation/Foundation.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <zlib.h>
+
+          static NSMutableArray<NSDictionary *> *testCandidates;
+          static NSMutableSet<NSString *> *testSeen;
+
+          static void add_candidate(NSString *url, NSString *title) {
+              if ([testSeen containsObject:url]) return;
+              [testSeen addObject:url];
+              [testCandidates addObject:@{@"url": url, @"title": title ?: @""}];
+          }
+
+          static void mlog(NSString *format, ...) {
+              (void)format;
+          }
+
+          #include "capture-parser.inc"
+
+          static void test_require(BOOL condition, NSString *message) {
+              if (!condition) {
+                  fprintf(stderr, "FAIL: %s\n", message.UTF8String);
+                  exit(1);
+              }
+          }
+
+          static void test_reset(void) {
+              for (NSNumber *fd in gCaptureConnections.allKeys) muse_capture_close(fd.intValue);
+              [testCandidates removeAllObjects];
+              [testSeen removeAllObjects];
+              gCaptureHttpMessages = 0;
+          }
+
+          static NSData *test_bytes(NSString *text) {
+              return [text dataUsingEncoding:NSUTF8StringEncoding];
+          }
+
+          static void test_feed(int fd, NSString *text, BOOL reading) {
+              muse_capture_feed(fd, test_bytes(text), reading);
+          }
+
+          static void test_feed_parts(int fd, NSData *data, NSUInteger size, BOOL reading) {
+              for (NSUInteger offset = 0; offset < data.length; offset += size) {
+                  NSUInteger length = MIN(size, data.length - offset);
+                  muse_capture_feed(fd, [data subdataWithRange:NSMakeRange(offset, length)], reading);
+              }
+          }
+
+          static NSDictionary *test_candidate(NSString *url) {
+              for (NSDictionary *candidate in testCandidates) {
+                  if ([candidate[@"url"] isEqualToString:url]) return candidate;
+              }
+              return nil;
+          }
+
+          static void test_request(int fd, NSString *path, NSString *host, BOOL reading) {
+              test_feed(fd, [NSString stringWithFormat:@"GET %@ HTTP/1.1\r\nHost: %@\r\n\r\n", path, host], reading);
+          }
+
+          static NSData *test_response(NSData *body, NSString *extraHeaders) {
+              NSString *header = [NSString stringWithFormat:@"HTTP/1.1 200 OK\r\nContent-Length: %lu\r\n%@\r\n",
+                                  (unsigned long)body.length, extraHeaders ?: @""];
+              NSMutableData *message = [test_bytes(header) mutableCopy];
+              [message appendData:body];
+              return message;
+          }
+
+          static NSData *test_json(id object) {
+              NSError *error = nil;
+              NSData *data = [NSJSONSerialization dataWithJSONObject:object options:0 error:&error];
+              test_require(data != nil, error.localizedDescription);
+              return data;
+          }
+
+          static void test_fragmented_signed_url(void) {
+              test_reset();
+              test_request(10, @"/api/video", @"api.example", NO);
+              NSString *url = @"https://cdn.example/index.m3u8?sig=abc%2Fdef+ghi&expires=123";
+              NSData *body = test_json(@{@"title": @"Video", @"url": url});
+              NSData *message = test_response(body, @"Content-Type: application/json\r\n");
+              NSData *marker = test_bytes(@"sig=abc");
+              NSRange split = [message rangeOfData:marker options:0 range:NSMakeRange(0, message.length)];
+              test_require(split.location != NSNotFound, @"signed URL test marker");
+              NSUInteger prefixLength = NSMaxRange(split);
+              muse_capture_feed(10, [message subdataWithRange:NSMakeRange(0, prefixLength)], YES);
+              test_require(testCandidates.count == 0, @"partial signature was added prematurely");
+              test_feed_parts(10, [message subdataWithRange:NSMakeRange(prefixLength, message.length - prefixLength)], 3, YES);
+              test_require(testCandidates.count == 1, @"fragmented URL candidate count");
+              test_require([test_candidate(url)[@"title"] isEqualToString:@"Video"], @"fragmented URL/title");
+          }
+
+          static void test_escaped_json_title_and_url(void) {
+              test_reset();
+              test_request(11, @"/api/video", @"api.example", NO);
+              NSString *json = @"{\"title\":\"\\u4e2d\\u6587\\\"片名\\\"\",\"url\":\"https:\\u002f\\u002fcdn.example\\u002findex.M3U8?sig=a%2Fb+c\"}";
+              NSData *message = test_response(test_bytes(json), @"Content-Type: application/json\r\n");
+              test_feed_parts(11, message, 1, YES);
+              NSString *url = @"https://cdn.example/index.M3U8?sig=a%2Fb+c";
+              test_require(testCandidates.count == 1, @"escaped JSON candidate count");
+              test_require([test_candidate(url)[@"title"] isEqualToString:@"中文\"片名\""], @"escaped JSON title decoding");
+          }
+
+          static void test_raw_fragmented_quoted_url(void) {
+              test_reset();
+              test_feed(12, @"{\"url\":\"https:\\/\\/cdn.example\\/index.m3u8?sig=a\\u0042", YES);
+              test_require(testCandidates.count == 0, @"unterminated quoted URL was added");
+              test_feed(12, @"%2Fc+z\"}", YES);
+              NSString *url = @"https://cdn.example/index.m3u8?sig=aB%2Fc+z";
+              test_require(testCandidates.count == 1 && test_candidate(url) != nil, @"raw escaped fragmented URL");
+              test_reset();
+              test_feed(13, @"{\"url\":\"https://cdn.example/index.m3u8?sig=partial", YES);
+              muse_capture_close(13);
+              test_require(testCandidates.count == 0, @"close accepted an unterminated JSON URL");
+              test_reset();
+              test_feed(14, @"{\"title\":\"Waiting Title\",\"url\":\"https://cdn.example/wait.m3u8?sig=a%2Fb+c\"", YES);
+              test_require(testCandidates.count == 0, @"raw JSON URL was added before the enclosing object completed");
+              test_feed(14, @"}", YES);
+              test_require([test_candidate(@"https://cdn.example/wait.m3u8?sig=a%2Fb+c")[@"title"] isEqualToString:@"Waiting Title"],
+                           @"raw JSON title was lost when the URL string arrived first");
+          }
+
+          static void test_two_connections_and_object_titles(void) {
+              test_reset();
+              test_request(20, @"/first", @"api.example", NO);
+              test_request(21, @"/second", @"api.example", NO);
+              NSString *firstURL = @"https://one.example/a.m3u8?key=one";
+              NSString *secondURL = @"https://two.example/b.m3u8?key=two";
+              NSData *first = test_response(test_json(@{@"title": @"First", @"url": firstURL}), nil);
+              NSData *second = test_response(test_json(@{@"title": @"Second", @"url": secondURL}), nil);
+              NSUInteger firstSplit = first.length / 2;
+              muse_capture_feed(20, [first subdataWithRange:NSMakeRange(0, firstSplit)], YES);
+              test_feed_parts(21, second, 5, YES);
+              muse_capture_feed(20, [first subdataWithRange:NSMakeRange(firstSplit, first.length - firstSplit)], YES);
+              test_require([test_candidate(firstURL)[@"title"] isEqualToString:@"First"], @"first fd title");
+              test_require([test_candidate(secondURL)[@"title"] isEqualToString:@"Second"], @"second fd title");
+              test_request(22, @"/nested", @"api.example", NO);
+              NSString *childURL = @"https://cdn.example/child.m3u8";
+              NSString *albumURL = @"https://cdn.example/album.m3u8";
+              NSDictionary *nested = @{@"title": @"Album", @"items": @[
+                  @{@"title": @"Child", @"url": childURL}, @{@"url": albumURL}
+              ]};
+              muse_capture_feed(22, test_response(test_json(nested), nil), YES);
+              test_require([test_candidate(childURL)[@"title"] isEqualToString:@"Child"], @"same-object title");
+              test_require([test_candidate(albumURL)[@"title"] isEqualToString:@"Album"], @"inherited parent title");
+          }
+
+          static void test_chunked_split_url(void) {
+              test_reset();
+              test_request(23, @"/api/list", @"api.example", NO);
+              NSString *url = @"https://cdn.example/index.m3u8?sig=first%2Fsecond+third";
+              NSData *body = test_json(@{@"title": @"Chunked", @"url": url});
+              NSMutableData *message = [test_bytes(@"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n") mutableCopy];
+              for (NSUInteger offset = 0; offset < body.length; offset += 11) {
+                  NSUInteger count = MIN((NSUInteger)11, body.length - offset);
+                  [message appendData:test_bytes([NSString stringWithFormat:@"%lx;part=yes\r\n", (unsigned long)count])];
+                  [message appendData:[body subdataWithRange:NSMakeRange(offset, count)]];
+                  [message appendData:test_bytes(@"\r\n")];
+              }
+              [message appendData:test_bytes(@"0\r\nChecksum: ignored\r\n\r\n")];
+              test_feed_parts(23, message, 2, YES);
+              test_require(testCandidates.count == 1 && test_candidate(url) != nil, @"dechunked URL");
+              test_require([test_candidate(url)[@"title"] isEqualToString:@"Chunked"], @"dechunked title");
+          }
+
+          static void test_loopback_query_and_server_direction(void) {
+              test_reset();
+              NSString *path = @"/parse?url=https%3A%2F%2Fcdn.example%2Findex.m3u8%3Fsig%3Da%252Fb%2Bc";
+              NSString *url = @"https://cdn.example/index.m3u8?sig=a%2Fb+c";
+              NSString *request = [NSString stringWithFormat:@"GET %@ HTTP/1.1\r\nHost: localhost:6001\r\n\r\n", path];
+              test_feed_parts(30, test_bytes(request), 3, YES);
+              test_require(testCandidates.count == 1 && test_candidate(url) != nil, @"outer query decode/signature preservation");
+              test_reset();
+              test_request(31, @"/parse?topicId=123", @"localhost:6006", YES);
+              test_require(testCandidates.count == 0, @"topicId request was added before an HLS response");
+              muse_capture_feed(31, test_response(test_bytes(@"{\"ok\":true}"), nil), NO);
+              test_require(testCandidates.count == 0, @"non-HLS topicId response was added");
+              test_request(31, @"/parse?topicId=123", @"localhost:6006", YES);
+              test_feed_parts(31, test_response(test_bytes(@"#EXTM3U\n#EXTINF:5,\nsegment.ts\n"), @"Content-Type: application/vnd.apple.mpegurl\r\n"), 4, NO);
+              test_require(testCandidates.count == 1 &&
+                           test_candidate(@"http://localhost:6006/parse?topicId=123") != nil, @"server-direction HLS response association");
+          }
+
+          static void test_close_delimited(void) {
+              test_reset();
+              test_request(40, @"/api/video", @"api.example", NO);
+              NSString *url = @"https://cdn.example/close.m3u8?sig=complete";
+              NSMutableData *message = [test_bytes(@"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n") mutableCopy];
+              [message appendData:test_json(@{@"title": @"Closed", @"url": url})];
+              test_feed_parts(40, message, 7, YES);
+              test_require(testCandidates.count == 0, @"close-delimited body completed before close");
+              muse_capture_close(40);
+              test_require(testCandidates.count == 1 && test_candidate(url) != nil, @"close-delimited capture");
+          }
+
+          static NSData *test_compress(NSData *data, int windowBits) {
+              z_stream stream = {0};
+              test_require(deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, windowBits, 8, Z_DEFAULT_STRATEGY) == Z_OK,
+                           @"compression initialization");
+              NSMutableData *output = [NSMutableData dataWithLength:deflateBound(&stream, data.length)];
+              stream.next_in = (Bytef *)data.bytes;
+              stream.avail_in = (uInt)data.length;
+              stream.next_out = output.mutableBytes;
+              stream.avail_out = (uInt)output.length;
+              int status = deflate(&stream, Z_FINISH);
+              test_require(status == Z_STREAM_END, @"compression completion");
+              output.length = stream.total_out;
+              deflateEnd(&stream);
+              return output;
+          }
+
+          static void test_gzip_and_deflate(void) {
+              for (NSNumber *windowBits in @[@(15 + 16), @15, @(-15)]) {
+                  test_reset();
+                  test_request(41, @"/api/video", @"api.example", NO);
+                  NSString *url = @"https://cdn.example/compressed.m3u8?sig=a%2Fb+c";
+                  NSData *compressed = test_compress(test_json(@{@"title": @"Compressed", @"url": url}), windowBits.intValue);
+                  NSString *encoding = windowBits.intValue == 31 ? @"gzip" : @"deflate";
+                  NSString *headers = [NSString stringWithFormat:@"Content-Type: application/json\r\nContent-Encoding: %@\r\n", encoding];
+                  test_feed_parts(41, test_response(compressed, headers), 7, YES);
+                  test_require(testCandidates.count == 1 && test_candidate(url) != nil, @"compressed response capture");
+              }
+          }
+
+          static void test_request_fragment_and_redirect(void) {
+              test_reset();
+              test_feed(50, @"GET /index.m3u8?sig=first", NO);
+              test_require(testCandidates.count == 0, @"request target completed before headers");
+              test_feed(50, @"%2Fsecond+third HTTP/1.1\r\nHost: cdn.example\r\n\r\n", NO);
+              NSString *url = @"http://cdn.example/index.m3u8?sig=first%2Fsecond+third";
+              test_require(testCandidates.count == 1 && test_candidate(url) != nil, @"relative request URL reconstruction");
+              test_reset();
+              test_request(51, @"/old/page", @"cdn.example", NO);
+              test_feed(51, @"HTTP/1.1 302 Found\r\nLocation: ../video/index.m3u8?sig=a%2Fb+c\r\nContent-Length: 0\r\n\r\n", YES);
+              test_require(test_candidate(@"http://cdn.example/video/index.m3u8?sig=a%2Fb+c") != nil, @"relative Location URL");
+              test_reset();
+              NSString *matrixPath = @"/session;id=7/index.m3u8;token=abc%2Fdef+ghi";
+              test_request(52, matrixPath, @"cdn.example", NO);
+              test_require(test_candidate(@"http://cdn.example/session;id=7/index.m3u8;token=abc%2Fdef+ghi") != nil,
+                           @"HLS matrix parameters were rejected or modified");
+          }
+
+          static void test_binary_and_memory_bounds(void) {
+              test_reset();
+              NSMutableData *tls = [NSMutableData dataWithLength:16384];
+              ((unsigned char *)tls.mutableBytes)[0] = 0x17;
+              for (NSUInteger index = 0; index < 64; index++) muse_capture_feed(60, tls, YES);
+              MuseCaptureConnection *connection = gCaptureConnections[@60];
+              test_require(connection->reading->buffer.length == 0 && connection->reading->body.length == 0,
+                           @"TLS bytes retained as text");
+              for (int fd = 100; fd < 140; fd++) test_feed(fd, @"GET ", NO);
+              test_require(gCaptureConnections.count <= kCaptureConnectionLimit, @"connection limit");
+              test_reset();
+              test_request(61, @"/large.ts", @"cdn.example", NO);
+              NSUInteger length = kCaptureBodyLimit + 128;
+              test_feed(61, [NSString stringWithFormat:@"HTTP/1.1 200 OK\r\nContent-Length: %lu\r\n\r\n", (unsigned long)length], YES);
+              NSMutableData *large = [NSMutableData dataWithLength:length];
+              memset(large.mutableBytes, 0x47, large.length);
+              test_feed_parts(61, large, 16384, YES);
+              test_require(testCandidates.count == 0, @"binary body generated a candidate");
+              test_request(61, @"/api/next", @"cdn.example", NO);
+              NSString *url = @"https://cdn.example/next.m3u8";
+              muse_capture_feed(61, test_response(test_json(@{@"url": url}), nil), YES);
+              test_require(test_candidate(url) != nil, @"large-body discard lost subsequent message framing");
+          }
+
+          int main(void) {
+              @autoreleasepool {
+                  testCandidates = [NSMutableArray array];
+                  testSeen = [NSMutableSet set];
+                  test_fragmented_signed_url();
+                  test_escaped_json_title_and_url();
+                  test_raw_fragmented_quoted_url();
+                  test_two_connections_and_object_titles();
+                  test_chunked_split_url();
+                  test_loopback_query_and_server_direction();
+                  test_close_delimited();
+                  test_gzip_and_deflate();
+                  test_request_fragment_and_redirect();
+                  test_binary_and_memory_bounds();
+                  test_reset();
+                  printf("capture parser tests passed (10 groups)\n");
+              }
+              return 0;
+          }
+          '''
+
+          hook_prefix = r'''
+          #import <Foundation/Foundation.h>
+          #include <sys/socket.h>
+          #include <sys/uio.h>
+          #include <unistd.h>
+          #include <errno.h>
+          #include <stdatomic.h>
+          #include <zlib.h>
+          #include <stdio.h>
+          #include <stdarg.h>
+          #include <string.h>
+
+          static _Atomic(BOOL) gReady;
+          static NSLock *gLock;
+          static NSMutableArray *gCands;
+          static NSMutableSet *gTestURLs;
+
+          static id add_candidate(NSString *url, NSString *title) {
+              if ([gTestURLs containsObject:url]) return nil;
+              [gTestURLs addObject:url];
+              NSDictionary *entry = @{@"url": url, @"title": title ?: @""};
+              [gCands addObject:entry];
+              return entry;
+          }
+
+          static void mlog(NSString *format, ...) {
+              va_list arguments;
+              va_start(arguments, format);
+              NSString *text = [[NSString alloc] initWithFormat:format arguments:arguments];
+              va_end(arguments);
+              fprintf(stderr, "%s\n", text.UTF8String);
+          }
+          '''
+
+          hook_exports = r'''
+          void muse_test_start(void) {
+              @autoreleasepool {
+                  gLock = [NSLock new];
+                  gCands = [NSMutableArray new];
+                  gTestURLs = [NSMutableSet new];
+                  muse_capture_start();
+                  gReady = YES;
+              }
+          }
+
+          unsigned long muse_test_count(void) {
+              __block NSUInteger count = 0;
+              dispatch_sync(gCaptureQueue, ^{ count = gCands.count; });
+              return count;
+          }
+
+          unsigned int muse_test_calls(void) {
+              unsigned int mask = 0;
+              for (int i = 0; i < MuseIoCount; i++) {
+                  if (atomic_load(&gCaptureIoCalls[i])) mask |= 1u << i;
+              }
+              return mask;
+          }
+          '''
+
+          hook_driver = r'''
+          #include <sys/socket.h>
+          #include <sys/uio.h>
+          #include <unistd.h>
+          #include <dlfcn.h>
+          #include <errno.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+
+          static void require(int condition, const char *message) {
+              if (!condition) {
+                  fprintf(stderr, "FAIL: %s\n", message);
+                  exit(1);
+              }
+          }
+
+          int main(void) {
+              void (*start)(void) = dlsym(RTLD_DEFAULT, "muse_test_start");
+              unsigned long (*count)(void) = dlsym(RTLD_DEFAULT, "muse_test_count");
+              unsigned int (*calls)(void) = dlsym(RTLD_DEFAULT, "muse_test_calls");
+              require(start && count && calls, "test dylib exports");
+              start();
+
+              int pipes[2];
+              require(pipe(pipes) == 0, "create pipe");
+              errno = EDOM;
+              require(write(pipes[1], "plain", 5) == 5 && errno == EDOM, "pipe write and errno");
+              char pipeData[5];
+              errno = ERANGE;
+              require(read(pipes[0], pipeData, sizeof(pipeData)) == 5 && errno == ERANGE, "pipe read and errno");
+              require(memcmp(pipeData, "plain", 5) == 0, "pipe contents");
+              close(pipes[0]);
+              close(pipes[1]);
+              require(count() == 0, "file IO must not create candidates");
+              char invalid;
+              require(read(-1, &invalid, 1) == -1 && errno == EBADF, "failed read result");
+              require(write(-1, "x", 1) == -1 && errno == EBADF, "failed write result");
+
+              for (int mode = 0; mode < 4; mode++) {
+                  int sockets[2];
+                  require(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0, "create sockets");
+                  char json[512];
+                  snprintf(json, sizeof(json),
+                           "{\"title\":\"mode%d\",\"url\":\"https://unit.example/mode%d.m3u8?sig=a%%2Bb\"}", mode, mode);
+                  char packet[1024];
+                  int packetLength = snprintf(packet, sizeof(packet),
+                                              "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
+                                              strlen(json), json);
+                  char received[1024] = {0};
+                  ssize_t sent = 0;
+                  ssize_t readLength = 0;
+                  if (mode == 0) {
+                      sent = write(sockets[0], packet, packetLength);
+                      readLength = read(sockets[1], received, sizeof(received));
+                  } else if (mode == 1) {
+                      sent = send(sockets[0], packet, packetLength, 0);
+                      readLength = recv(sockets[1], received, sizeof(received), 0);
+                  } else if (mode == 2) {
+                      sent = sendto(sockets[0], packet, packetLength, 0, NULL, 0);
+                      readLength = recvfrom(sockets[1], received, sizeof(received), 0, NULL, NULL);
+                  } else {
+                      struct iovec sendVectors[2] = {
+                          { .iov_base = packet, .iov_len = 19 },
+                          { .iov_base = packet + 19, .iov_len = packetLength - 19 }
+                      };
+                      struct msghdr sendMessage = {0};
+                      sendMessage.msg_iov = sendVectors;
+                      sendMessage.msg_iovlen = 2;
+                      sent = sendmsg(sockets[0], &sendMessage, 0);
+                      struct iovec recvVectors[2] = {
+                          { .iov_base = received, .iov_len = 37 },
+                          { .iov_base = received + 37, .iov_len = sizeof(received) - 37 }
+                      };
+                      struct msghdr recvMessage = {0};
+                      recvMessage.msg_iov = recvVectors;
+                      recvMessage.msg_iovlen = 2;
+                      readLength = recvmsg(sockets[1], &recvMessage, 0);
+                  }
+                  require(sent == packetLength && readLength == packetLength, "socket IO results");
+                  require(memcmp(received, packet, packetLength) == 0, "socket payload must be preserved");
+                  require(count() == (unsigned long)mode + 1, "one deduplicated candidate per socket pair");
+                  close(sockets[0]);
+                  close(sockets[1]);
+              }
+              require(calls() == 0xffu, "all eight IO hooks executed");
+              puts("PASS: native IO hooks, stream payloads, deduplication, file IO and errno");
+              return 0;
+          }
+          '''
+
+          source = Path("MuseHook.m").read_text(encoding="utf-8")
+          parser_start = source.index("// ───────────────────────── 流量抓取")
+          hooks_start = source.index("// ───────────────────────── 网络调用")
+          bootstrap_start = source.index("// ───────────────────────── 入口", hooks_start)
+          parser = source[parser_start:hooks_start]
+          hooks = source[hooks_start:bootstrap_start]
+          target = Path(os.environ["RUNNER_TEMP"]) / "musehook-capture-tests"
+          target.mkdir(parents=True, exist_ok=True)
+          (target / "capture-parser.inc").write_text(parser, encoding="utf-8")
+          (target / "capture-parser-tests.m").write_text(parser_tests, encoding="utf-8")
+          (target / "capture-hook-library.m").write_text(hook_prefix + parser + hooks + hook_exports, encoding="utf-8")
+          (target / "capture-hook-test.c").write_text(hook_driver, encoding="utf-8")
+          PY
+          TEST_DIR="$RUNNER_TEMP/musehook-capture-tests"
+          xcrun clang -fobjc-arc -framework Foundation -lz "$TEST_DIR/capture-parser-tests.m" -o "$TEST_DIR/capture-parser-tests"
+          "$TEST_DIR/capture-parser-tests"
+          xcrun clang -fobjc-arc -dynamiclib -framework Foundation -lz "$TEST_DIR/capture-hook-library.m" -o "$TEST_DIR/capture-hook.dylib"
+          xcrun clang "$TEST_DIR/capture-hook-test.c" -o "$TEST_DIR/capture-hook-test"
+          DYLD_INSERT_LIBRARIES="$TEST_DIR/capture-hook.dylib" "$TEST_DIR/capture-hook-test"
+
       - name: Build dylib (arm64)
         run: |
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
@@ -31,6 +496,7 @@ jobs:
             -framework UIKit \
             -framework CoreGraphics \
             -framework CoreFoundation \
+            -lz \
             -o MuseHook.dylib \
             MuseHook.m
           ls -lh MuseHook.dylib

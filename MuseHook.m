@@ -7,7 +7,7 @@
 //    · 点悬浮球 → 原生列表，勾选 → 点「下载选中」才真正下
 //
 //  原理：接口是明文 http://IP:6868，Flutter(dart:io) 走 BSD socket，
-//        dylib 用 dyld __interpose 挂 send/write/recv/read，从响应体里捡 m3u8。
+//        dylib 观察 socket 的读写入口，重组 HTTP 和本机播放代理中的播放地址。
 //        UI 把悬浮球加到应用现有主窗口，列表由现有控制器弹出。
 //
 
@@ -17,6 +17,9 @@
 
 #include <sys/socket.h>
 #include <unistd.h>
+#include <sys/uio.h>
+#include <errno.h>
+#include <stdatomic.h>
 #include <dlfcn.h>
 #include <string.h>
 #include <strings.h>
@@ -90,7 +93,7 @@ static NSMutableArray<MuseCandidate *> *gCands;   // 最新在前
 static NSMutableDictionary<NSString *, NSNumber *> *gSeen;
 static NSLock *gLock;
 static NSInteger gUnseen = 0;                     // 角标
-static BOOL gReady = NO;
+static _Atomic(BOOL) gReady = NO;
 
 static void notify_list_changed(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -705,80 +708,793 @@ static NSArray<MuseCandidate *> *cand_snapshot(void) {
 @end
 
 // ───────────────────────── 流量抓取 ─────────────────────────
-static NSString *gLastTitle = nil;   // 从 JSON 里顺手捞的标题
+// HTTP capture state is owned by the caller's serial capture queue.
+#include <zlib.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
 
-static NSString *peek_title(NSString *s) {
-    NSRange r = [s rangeOfString:@"\"title\""];
-    if (r.location == NSNotFound) return nil;
-    NSString *rest = [s substringFromIndex:r.location + r.length];
-    NSRange colon = [rest rangeOfString:@":"];
-    if (colon.location == NSNotFound) return nil;
-    rest = [rest substringFromIndex:colon.location + 1];
-    NSRange q1 = [rest rangeOfString:@"\""];
-    if (q1.location == NSNotFound) return nil;
-    rest = [rest substringFromIndex:q1.location + 1];
-    NSRange q2 = [rest rangeOfString:@"\""];
-    if (q2.location == NSNotFound) return nil;
-    NSString *t = [rest substringToIndex:q2.location];
-    if (t.length > 40) t = [t substringToIndex:40];
-    return t.length ? t : nil;
+static const NSUInteger kCaptureHeaderLimit = 64 * 1024;
+static const NSUInteger kCaptureBodyLimit = 2 * 1024 * 1024;
+static const NSUInteger kCaptureDecodedLimit = 4 * 1024 * 1024;
+static const NSUInteger kCaptureRawTextLimit = 256 * 1024;
+static const NSUInteger kCaptureConnectionLimit = 32;
+static const NSUInteger kCaptureRequestLimit = 8;
+static const NSUInteger kCaptureMemoryLimit = 8 * 1024 * 1024;
+static NSUInteger gCaptureHttpMessages = 0;
+
+typedef NS_ENUM(NSUInteger, MuseCaptureBodyMode) {
+    MuseCaptureHeaders,
+    MuseCaptureLengthBody,
+    MuseCaptureChunkedBody,
+    MuseCaptureCloseBody
+};
+
+@interface MuseCaptureStream : NSObject {
+@public
+    NSMutableData *buffer;
+    NSMutableData *body;
+    NSDictionary<NSString *, NSString *> *headers;
+    NSString *url;
+    MuseCaptureBodyMode mode;
+    NSUInteger remaining;
+    NSUInteger chunkRemaining;
+    BOOL needsChunkCRLF;
+    BOOL trailers;
+    BOOL discardBody;
+    BOOL unframed;
+}
+@end
+
+@implementation MuseCaptureStream
+- (instancetype)init {
+    if ((self = [super init])) {
+        buffer = [NSMutableData data];
+        body = [NSMutableData data];
+    }
+    return self;
+}
+@end
+
+@interface MuseCaptureConnection : NSObject {
+@public
+    MuseCaptureStream *reading;
+    MuseCaptureStream *writing;
+    NSMutableArray<NSDictionary *> *readingRequests;
+    NSMutableArray<NSDictionary *> *writingRequests;
+    NSUInteger lastUse;
+}
+@end
+
+@implementation MuseCaptureConnection
+- (instancetype)init {
+    if ((self = [super init])) {
+        reading = [MuseCaptureStream new];
+        writing = [MuseCaptureStream new];
+        readingRequests = [NSMutableArray array];
+        writingRequests = [NSMutableArray array];
+    }
+    return self;
+}
+@end
+
+static NSMutableDictionary<NSNumber *, MuseCaptureConnection *> *gCaptureConnections;
+static NSUInteger gCaptureUseSequence;
+
+static NSRange muse_capture_find(NSData *data, const char *needle, NSUInteger length) {
+    return [data rangeOfData:[NSData dataWithBytes:needle length:length]
+                    options:0 range:NSMakeRange(0, data.length)];
 }
 
-static void scan_buf(const char *buf, size_t n) {
-    if (!gReady || n == 0) return;
-    if (strnstr(buf, "m3u8", n) == NULL && strnstr(buf, "title", n) == NULL) return;
-    @autoreleasepool {
-        NSString *s = [[NSString alloc] initWithBytes:buf length:n encoding:NSUTF8StringEncoding];
-        if (!s) s = [[NSString alloc] initWithBytes:buf length:n encoding:NSISOLatin1StringEncoding];
-        if (!s) return;
-        NSString *t = peek_title(s);
-        if (t) gLastTitle = t;
+static void muse_capture_consume(NSMutableData *data, NSUInteger length) {
+    [data replaceBytesInRange:NSMakeRange(0, length) withBytes:NULL length:0];
+}
 
-        static NSRegularExpression *re;
-        static dispatch_once_t once;
-        dispatch_once(&once, ^{
-            re = [NSRegularExpression regularExpressionWithPattern:
-                  @"https?://[^\\s\"'<>\\\\]{6,300}?\\.m3u8[^\\s\"'<>\\\\]*"
-                                                          options:NSRegularExpressionCaseInsensitive error:nil];
-        });
-        for (NSTextCheckingResult *m in [re matchesInString:s options:0 range:NSMakeRange(0, s.length)]) {
-            NSString *u = [s substringWithRange:m.range];
-            u = [u stringByReplacingOccurrencesOfString:@"\\/" withString:@"/"];
-            add_candidate(u, gLastTitle);
+static BOOL muse_capture_http_prefix(NSData *data) {
+    static const char *prefixes[] = {
+        "HTTP/1.", "GET ", "POST ", "HEAD ", "PUT ", "PATCH ",
+        "DELETE ", "OPTIONS ", "CONNECT ", "TRACE "
+    };
+    for (NSUInteger i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+        NSUInteger length = MIN(data.length, strlen(prefixes[i]));
+        if (length && memcmp(data.bytes, prefixes[i], length) == 0) return YES;
+    }
+    return NO;
+}
+
+static BOOL muse_capture_text_prefix(NSData *data) {
+    const unsigned char *bytes = data.bytes;
+    NSUInteger offset = 0;
+    while (offset < data.length &&
+           (bytes[offset] == ' ' || bytes[offset] == '\r' ||
+            bytes[offset] == '\n' || bytes[offset] == '\t')) offset++;
+    if (offset == data.length) return YES;
+    unsigned char first = bytes[offset];
+    if (first == '{' || first == '[' || first == '"' || first == '<' || first == '#') return YES;
+    static const char *prefixes[] = {"http://", "https://"};
+    for (NSUInteger i = 0; i < 2; i++) {
+        NSUInteger length = MIN(data.length - offset, strlen(prefixes[i]));
+        if (strncasecmp((const char *)bytes + offset, prefixes[i], length) == 0) return YES;
+    }
+    return NO;
+}
+
+static BOOL muse_capture_valid_url(NSString *value) {
+    if (value.length == 0 || value.length > 8192) return NO;
+    NSURLComponents *parts = [NSURLComponents componentsWithString:value];
+    NSString *scheme = parts.scheme.lowercaseString;
+    return parts.host.length && ([scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"]);
+}
+
+static BOOL muse_capture_hls_url(NSString *value) {
+    if (!muse_capture_valid_url(value)) return NO;
+    NSURLComponents *parts = [NSURLComponents componentsWithString:value];
+    NSString *filename = [parts.path.lastPathComponent componentsSeparatedByString:@";"].firstObject;
+    return [filename.pathExtension.lowercaseString isEqualToString:@"m3u8"];
+}
+
+static NSString *muse_capture_inner_url(NSString *value) {
+    if (!muse_capture_valid_url(value)) return nil;
+    NSURLComponents *parts = [NSURLComponents componentsWithString:value];
+    NSString *host = parts.host.lowercaseString;
+    BOOL loopback = [host isEqualToString:@"localhost"] || [host isEqualToString:@"127.0.0.1"] ||
+                    [host isEqualToString:@"::1"] || [host isEqualToString:@"[::1]"];
+    if (!loopback || ![parts.path isEqualToString:@"/parse"]) return nil;
+    for (NSURLQueryItem *item in parts.queryItems) {
+        // queryItems decodes the outer query once and preserves literal '+'.
+        if ([item.name isEqualToString:@"url"] && muse_capture_valid_url(item.value)) return item.value;
+    }
+    return nil;
+}
+
+static void muse_capture_url(NSString *value, NSString *title) {
+    if (muse_capture_hls_url(value)) add_candidate(value, title);
+    NSString *inner = muse_capture_inner_url(value);
+    if (muse_capture_hls_url(inner)) add_candidate(inner, title);
+}
+
+static NSString *muse_capture_decode_json_string(NSString *token) {
+    id decoded = [NSJSONSerialization JSONObjectWithData:[token dataUsingEncoding:NSUTF8StringEncoding]
+                                                options:NSJSONReadingFragmentsAllowed error:NULL];
+    return [decoded isKindOfClass:[NSString class]] ? decoded : nil;
+}
+
+static BOOL muse_capture_inside_quote(NSString *text, NSUInteger location) {
+    BOOL quoted = NO;
+    BOOL escaped = NO;
+    for (NSUInteger index = 0; index < location; index++) {
+        unichar character = [text characterAtIndex:index];
+        if (escaped) escaped = NO;
+        else if (character == '\\') escaped = YES;
+        else if (character == '"') quoted = !quoted;
+    }
+    return quoted;
+}
+
+static void muse_capture_scan_text(NSString *text, NSString *title, BOOL complete) {
+    if (!text.length) return;
+    static NSRegularExpression *quoted;
+    static NSRegularExpression *plainURLs;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        quoted = [NSRegularExpression regularExpressionWithPattern:@"\"(?:[^\"\\\\]|\\\\.)*\""
+                                                           options:0 error:NULL];
+        plainURLs = [NSRegularExpression regularExpressionWithPattern:@"https?://[^\\s\"'<>\\\\]+"
+                                                              options:NSRegularExpressionCaseInsensitive error:NULL];
+    });
+    for (NSTextCheckingResult *match in [quoted matchesInString:text options:0 range:NSMakeRange(0, text.length)]) {
+        NSString *decoded = muse_capture_decode_json_string([text substringWithRange:match.range]);
+        if (decoded) muse_capture_url(decoded, title);
+    }
+    NSString *normalized = [text stringByReplacingOccurrencesOfString:@"\\/" withString:@"/"];
+    for (NSTextCheckingResult *match in [plainURLs matchesInString:normalized options:0
+                                                           range:NSMakeRange(0, normalized.length)]) {
+        if (muse_capture_inside_quote(normalized, match.range.location)) continue;
+        if (NSMaxRange(match.range) < normalized.length &&
+            [normalized characterAtIndex:NSMaxRange(match.range)] == '\\') continue;
+        // A URL reaching a live buffer's end may still be receiving its signature.
+        if (!complete && NSMaxRange(match.range) == normalized.length) continue;
+        muse_capture_url([normalized substringWithRange:match.range], title);
+    }
+}
+
+static void muse_capture_walk_json(id object, NSString *title, NSUInteger depth) {
+    if (depth > 32) return;
+    if ([object isKindOfClass:[NSDictionary class]]) {
+        id ownTitle = object[@"title"];
+        NSString *matchingTitle = [ownTitle isKindOfClass:[NSString class]] ? ownTitle : title;
+        for (id value in [object allValues]) muse_capture_walk_json(value, matchingTitle, depth + 1);
+    } else if ([object isKindOfClass:[NSArray class]]) {
+        for (id value in object) muse_capture_walk_json(value, title, depth + 1);
+    } else if ([object isKindOfClass:[NSString class]]) {
+        muse_capture_url(object, title);
+        muse_capture_scan_text(object, title, YES);
+    }
+}
+
+static NSData *muse_capture_inflate(NSData *input, int windowBits) {
+    if (!input.length || input.length > kCaptureBodyLimit) return nil;
+    z_stream stream = {0};
+    stream.next_in = (Bytef *)input.bytes;
+    stream.avail_in = (uInt)input.length;
+    if (inflateInit2(&stream, windowBits) != Z_OK) return nil;
+    NSMutableData *output = [NSMutableData data];
+    unsigned char chunk[16384];
+    int status = Z_OK;
+    while (status == Z_OK) {
+        stream.next_out = chunk;
+        stream.avail_out = sizeof(chunk);
+        status = inflate(&stream, Z_NO_FLUSH);
+        NSUInteger produced = sizeof(chunk) - stream.avail_out;
+        if (produced > kCaptureDecodedLimit - output.length) {
+            status = Z_MEM_ERROR;
+            break;
+        }
+        [output appendBytes:chunk length:produced];
+        if (status == Z_OK && produced == 0 && stream.avail_in == 0) {
+            status = Z_DATA_ERROR;
+            break;
+        }
+    }
+    inflateEnd(&stream);
+    return status == Z_STREAM_END ? output : nil;
+}
+
+static NSData *muse_capture_decode_body(NSData *body, NSString *encoding) {
+    NSString *name = [[encoding lowercaseString] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+    if (!name.length || [name isEqualToString:@"identity"]) return body;
+    if ([name isEqualToString:@"gzip"] || [name isEqualToString:@"x-gzip"]) return muse_capture_inflate(body, 15 + 16);
+    if ([name isEqualToString:@"deflate"]) {
+        NSData *decoded = muse_capture_inflate(body, 15);
+        return decoded ?: muse_capture_inflate(body, -15);
+    }
+    return nil;
+}
+
+static void muse_capture_scan_body(NSData *encodedBody, NSDictionary *headers, NSString *requestURL) {
+    NSData *decodedBody = muse_capture_decode_body(encodedBody, headers[@"content-encoding"]);
+    if (!decodedBody.length) return;
+    id json = [NSJSONSerialization JSONObjectWithData:decodedBody options:NSJSONReadingFragmentsAllowed error:NULL];
+    if (json) {
+        muse_capture_walk_json(json, nil, 0);
+        return;
+    }
+    NSString *text = [[NSString alloc] initWithData:decodedBody encoding:NSUTF8StringEncoding];
+    if (!text) return;
+    NSString *trimmed = [text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if ([trimmed hasPrefix:@"#EXTM3U"] && muse_capture_valid_url(requestURL)) {
+        NSString *inner = muse_capture_inner_url(requestURL);
+        // An extensionless parse/topicId endpoint is accepted only after this HLS response.
+        add_candidate(muse_capture_hls_url(inner) ? inner : requestURL, nil);
+    }
+    muse_capture_scan_text(text, nil, YES);
+}
+
+static void muse_capture_reset_message(MuseCaptureStream *stream) {
+    stream->body.length = 0;
+    stream->headers = nil;
+    stream->url = nil;
+    stream->mode = MuseCaptureHeaders;
+    stream->remaining = 0;
+    stream->chunkRemaining = 0;
+    stream->needsChunkCRLF = NO;
+    stream->trailers = NO;
+    stream->discardBody = NO;
+    stream->unframed = NO;
+}
+
+static void muse_capture_finish_message(MuseCaptureStream *stream) {
+    if (!stream->discardBody) muse_capture_scan_body(stream->body, stream->headers, stream->url);
+    gCaptureHttpMessages++;
+    muse_capture_reset_message(stream);
+}
+
+static void muse_capture_append_body(MuseCaptureStream *stream, const void *bytes, NSUInteger length) {
+    if (stream->discardBody) return;
+    if (length > kCaptureBodyLimit - stream->body.length) {
+        stream->body.length = 0;
+        stream->discardBody = YES;
+        return;
+    }
+    [stream->body appendBytes:bytes length:length];
+}
+
+static BOOL muse_capture_unsigned(NSString *value, int base, NSUInteger *result) {
+    if (!value.length) return NO;
+    const char *start = value.UTF8String;
+    if (!start || *start == '-' || *start == '+') return NO;
+    errno = 0;
+    char *end = NULL;
+    unsigned long long number = strtoull(start, &end, base);
+    if (errno || !end || end == start || *end || number > NSUIntegerMax) return NO;
+    *result = (NSUInteger)number;
+    return YES;
+}
+
+static BOOL muse_capture_begin_message(MuseCaptureConnection *connection, MuseCaptureStream *stream, BOOL reading) {
+    NSRange end = muse_capture_find(stream->buffer, "\r\n\r\n", 4);
+    if (end.location == NSNotFound) return NO;
+    NSData *headerData = [stream->buffer subdataWithRange:NSMakeRange(0, end.location)];
+    NSString *headerText = [[NSString alloc] initWithData:headerData encoding:NSISOLatin1StringEncoding];
+    NSArray<NSString *> *lines = [headerText componentsSeparatedByString:@"\r\n"];
+    NSArray<NSString *> *parts = [[lines.firstObject componentsSeparatedByString:@" "]
+                                filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"length > 0"]];
+    if (parts.count < 2) {
+        stream->buffer.length = 0;
+        return NO;
+    }
+    NSMutableDictionary *parsedHeaders = [NSMutableDictionary dictionary];
+    for (NSUInteger index = 1; index < lines.count; index++) {
+        NSRange colon = [lines[index] rangeOfString:@":"];
+        if (colon.location == NSNotFound) continue;
+        NSString *name = [[lines[index] substringToIndex:colon.location] lowercaseString];
+        NSString *value = [[lines[index] substringFromIndex:colon.location + 1]
+                           stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        parsedHeaders[name] = value;
+    }
+    muse_capture_consume(stream->buffer, NSMaxRange(end));
+    stream->headers = parsedHeaders;
+    BOOL response = [parts[0] hasPrefix:@"HTTP/1."];
+    BOOL noBody = NO;
+    if (response) {
+        NSInteger status = [parts[1] integerValue];
+        NSMutableArray *requests = reading ? connection->readingRequests : connection->writingRequests;
+        NSDictionary *request = requests.firstObject;
+        stream->url = request[@"url"];
+        BOOL informational = status >= 100 && status < 200;
+        noBody = informational || status == 204 || status == 304 || [request[@"method"] isEqualToString:@"HEAD"] ||
+                 ([request[@"method"] isEqualToString:@"CONNECT"] && status >= 200 && status < 300);
+        if (!informational && requests.count) [requests removeObjectAtIndex:0];
+        NSString *location = parsedHeaders[@"location"];
+        if (location.length) {
+            NSURL *base = stream->url.length ? [NSURL URLWithString:stream->url] : nil;
+            NSString *redirect = [NSURL URLWithString:location relativeToURL:base].absoluteString;
+            muse_capture_url(redirect, nil);
+        }
+    } else {
+        NSString *target = parts[1];
+        NSString *host = parsedHeaders[@"host"];
+        if (muse_capture_valid_url(target)) stream->url = target;
+        else if ([target hasPrefix:@"/"] && host.length) stream->url = [NSString stringWithFormat:@"http://%@%@", host, target];
+        if (!muse_capture_valid_url(stream->url)) stream->url = nil;
+        NSMutableArray *requests = reading ? connection->writingRequests : connection->readingRequests;
+        if (requests.count >= kCaptureRequestLimit) [requests removeObjectAtIndex:0];
+        [requests addObject:@{@"url": stream->url ?: @"", @"method": parts[0]}];
+        muse_capture_url(stream->url, nil);
+    }
+    NSString *transfer = [parsedHeaders[@"transfer-encoding"] lowercaseString];
+    NSUInteger length = 0;
+    if (noBody) {
+        muse_capture_finish_message(stream);
+    } else if (transfer.length && [transfer rangeOfString:@"chunked"].location != NSNotFound) {
+        stream->mode = MuseCaptureChunkedBody;
+    } else if (parsedHeaders[@"content-length"]) {
+        if (!muse_capture_unsigned(parsedHeaders[@"content-length"], 10, &length)) {
+            stream->buffer.length = 0;
+            muse_capture_reset_message(stream);
+            return NO;
+        }
+        stream->remaining = length;
+        stream->mode = MuseCaptureLengthBody;
+        if (!length) muse_capture_finish_message(stream);
+    } else if (response) {
+        stream->mode = MuseCaptureCloseBody;
+    } else {
+        muse_capture_finish_message(stream);
+    }
+    return YES;
+}
+
+static void muse_capture_raw_text(MuseCaptureStream *stream, BOOL complete) {
+    NSString *text = [[NSString alloc] initWithData:stream->buffer encoding:NSUTF8StringEncoding];
+    if (!text) return;
+    id json = [NSJSONSerialization JSONObjectWithData:stream->buffer options:NSJSONReadingFragmentsAllowed error:NULL];
+    if (json) {
+        muse_capture_walk_json(json, nil, 0);
+        stream->buffer.length = 0;
+        stream->unframed = NO;
+    } else {
+        NSString *trimmed = [text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (!complete && ([trimmed hasPrefix:@"{"] || [trimmed hasPrefix:@"["])) return;
+        muse_capture_scan_text(text, nil, complete);
+    }
+}
+
+static void muse_capture_process(MuseCaptureConnection *connection, MuseCaptureStream *stream, BOOL reading) {
+    while (stream->buffer.length) {
+        if (stream->mode == MuseCaptureHeaders) {
+            if (stream->unframed || !muse_capture_http_prefix(stream->buffer)) {
+                if (!stream->unframed && !muse_capture_text_prefix(stream->buffer)) {
+                    stream->buffer.length = 0;
+                    return;
+                }
+                stream->unframed = YES;
+                muse_capture_raw_text(stream, NO);
+                if (stream->buffer.length > kCaptureRawTextLimit) {
+                    muse_capture_consume(stream->buffer, stream->buffer.length - 8192);
+                }
+                return;
+            }
+            NSRange headerEnd = muse_capture_find(stream->buffer, "\r\n\r\n", 4);
+            if (headerEnd.location == NSNotFound) {
+                if (stream->buffer.length > kCaptureHeaderLimit) stream->buffer.length = 0;
+                return;
+            }
+            if (NSMaxRange(headerEnd) > kCaptureHeaderLimit) {
+                stream->buffer.length = 0;
+                return;
+            }
+            if (!muse_capture_begin_message(connection, stream, reading)) return;
+        } else if (stream->mode == MuseCaptureLengthBody) {
+            NSUInteger count = MIN(stream->remaining, stream->buffer.length);
+            muse_capture_append_body(stream, stream->buffer.bytes, count);
+            muse_capture_consume(stream->buffer, count);
+            stream->remaining -= count;
+            if (!stream->remaining) muse_capture_finish_message(stream);
+        } else if (stream->mode == MuseCaptureCloseBody) {
+            muse_capture_append_body(stream, stream->buffer.bytes, stream->buffer.length);
+            stream->buffer.length = 0;
+        } else if (stream->trailers) {
+            if (stream->buffer.length >= 2 && memcmp(stream->buffer.bytes, "\r\n", 2) == 0) {
+                muse_capture_consume(stream->buffer, 2);
+                muse_capture_finish_message(stream);
+                continue;
+            }
+            NSRange end = muse_capture_find(stream->buffer, "\r\n\r\n", 4);
+            if (end.location == NSNotFound) {
+                if (stream->buffer.length > kCaptureHeaderLimit) {
+                    stream->buffer.length = 0;
+                    muse_capture_reset_message(stream);
+                }
+                return;
+            }
+            muse_capture_consume(stream->buffer, NSMaxRange(end));
+            muse_capture_finish_message(stream);
+        } else if (stream->needsChunkCRLF) {
+            if (stream->buffer.length < 2) return;
+            if (memcmp(stream->buffer.bytes, "\r\n", 2) != 0) {
+                stream->buffer.length = 0;
+                muse_capture_reset_message(stream);
+                return;
+            }
+            muse_capture_consume(stream->buffer, 2);
+            stream->needsChunkCRLF = NO;
+        } else if (stream->chunkRemaining) {
+            NSUInteger count = MIN(stream->chunkRemaining, stream->buffer.length);
+            muse_capture_append_body(stream, stream->buffer.bytes, count);
+            muse_capture_consume(stream->buffer, count);
+            stream->chunkRemaining -= count;
+            if (!stream->chunkRemaining) stream->needsChunkCRLF = YES;
+        } else {
+            NSRange end = muse_capture_find(stream->buffer, "\r\n", 2);
+            if (end.location == NSNotFound) {
+                if (stream->buffer.length > 4096) {
+                    stream->buffer.length = 0;
+                    muse_capture_reset_message(stream);
+                }
+                return;
+            }
+            NSString *line = [[NSString alloc] initWithData:[stream->buffer subdataWithRange:NSMakeRange(0, end.location)]
+                                                  encoding:NSASCIIStringEncoding];
+            NSString *size = [[line componentsSeparatedByString:@";"].firstObject
+                              stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+            NSUInteger chunkSize = 0;
+            if (!muse_capture_unsigned(size, 16, &chunkSize)) {
+                stream->buffer.length = 0;
+                muse_capture_reset_message(stream);
+                return;
+            }
+            muse_capture_consume(stream->buffer, NSMaxRange(end));
+            stream->chunkRemaining = chunkSize;
+            if (!chunkSize) stream->trailers = YES;
         }
     }
 }
 
-// ───────────────────────── 挂钩（零 dlsym 版） ─────────────────────────
-// 关键修法：只 interpose send / recv，内部改用 **sendto / recvfrom** 调原始实现。
-// 这两个符号没被我们 interpose，所以直接落到 libsystem，不存在：
-//   · dlsym(RTLD_NEXT) 返回 NULL → 空指针调用（上一版闪退的头号原因）
-//   · 自己调自己 → 无限递归
-static ssize_t my_send(int fd, const void *buf, size_t len, int flags) {
-    if (gReady && buf && len) {
-        @try { scan_buf((const char *)buf, len); } @catch (__unused NSException *e) {}
-    }
-    return sendto(fd, buf, len, flags, NULL, 0);
+static NSUInteger muse_capture_memory(MuseCaptureConnection *connection) {
+    return connection->reading->buffer.length + connection->reading->body.length +
+           connection->writing->buffer.length + connection->writing->body.length;
 }
 
-static ssize_t my_recv(int fd, void *buf, size_t len, int flags) {
-    ssize_t n = recvfrom(fd, buf, len, flags, NULL, NULL);
-    if (gReady && n > 0 && buf) {
-        @try { scan_buf((const char *)buf, (size_t)n); } @catch (__unused NSException *e) {}
+static void muse_capture_trim(NSNumber *keepKey) {
+    NSUInteger bytes = 0;
+    for (MuseCaptureConnection *connection in gCaptureConnections.allValues) bytes += muse_capture_memory(connection);
+    while (gCaptureConnections.count > kCaptureConnectionLimit || bytes > kCaptureMemoryLimit) {
+        NSNumber *oldestKey = nil;
+        NSUInteger oldestUse = NSUIntegerMax;
+        for (NSNumber *key in gCaptureConnections) {
+            MuseCaptureConnection *connection = gCaptureConnections[key];
+            if (![key isEqual:keepKey] && connection->lastUse < oldestUse) {
+                oldestKey = key;
+                oldestUse = connection->lastUse;
+            }
+        }
+        if (!oldestKey) break;
+        bytes -= muse_capture_memory(gCaptureConnections[oldestKey]);
+        [gCaptureConnections removeObjectForKey:oldestKey];
     }
-    return n;
+}
+
+static void muse_capture_feed(int fd, NSData *data, BOOL reading) {
+    if (fd < 0 || !data.length) return;
+    @autoreleasepool {
+        if (!gCaptureConnections) gCaptureConnections = [NSMutableDictionary dictionary];
+        NSNumber *key = @(fd);
+        MuseCaptureConnection *connection = gCaptureConnections[key];
+        if (!connection) {
+            connection = [MuseCaptureConnection new];
+            gCaptureConnections[key] = connection;
+        }
+        connection->lastUse = ++gCaptureUseSequence;
+        MuseCaptureStream *stream = reading ? connection->reading : connection->writing;
+        const unsigned char *bytes = data.bytes;
+        for (NSUInteger offset = 0; offset < data.length;) {
+            NSUInteger count = MIN((NSUInteger)16384, data.length - offset);
+            NSData *piece = [NSData dataWithBytesNoCopy:(void *)(bytes + offset) length:count freeWhenDone:NO];
+            if (stream->mode != MuseCaptureHeaders || stream->buffer.length ||
+                muse_capture_http_prefix(piece) || muse_capture_text_prefix(piece)) {
+                [stream->buffer appendBytes:bytes + offset length:count];
+                muse_capture_process(connection, stream, reading);
+            }
+            offset += count;
+        }
+        muse_capture_trim(key);
+    }
+}
+
+static void muse_capture_close(int fd) {
+    @autoreleasepool {
+        NSNumber *key = @(fd);
+        MuseCaptureConnection *connection = gCaptureConnections[key];
+        if (!connection) return;
+        for (MuseCaptureStream *stream in @[connection->reading, connection->writing]) {
+            if (stream->mode == MuseCaptureCloseBody) muse_capture_finish_message(stream);
+            else if (stream->unframed) muse_capture_raw_text(stream, YES);
+        }
+        [gCaptureConnections removeObjectForKey:key];
+    }
+}
+
+// ───────────────────────── 网络调用 ─────────────────────────
+enum {
+    MuseIoRead, MuseIoWrite, MuseIoRecv, MuseIoRecvFrom,
+    MuseIoRecvMsg, MuseIoSend, MuseIoSendTo, MuseIoSendMsg, MuseIoCount
+};
+static _Atomic(unsigned long long) gCaptureIoCalls[MuseIoCount];
+static _Atomic(size_t) gCaptureQueuedBytes;
+static __thread unsigned int gCaptureDepth;
+static dispatch_queue_t gCaptureQueue;
+static dispatch_source_t gCaptureTimer;
+static const size_t kCaptureQueueBudget = 8 * 1024 * 1024;
+
+static void muse_capture_vectors(int fd, const struct iovec *vectors, size_t count,
+                                 size_t length, BOOL reading) {
+    if (!length || length > kCaptureQueueBudget || !vectors || !gCaptureQueue) return;
+    int type = 0;
+    socklen_t typeLength = sizeof(type);
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &typeLength) != 0 || type != SOCK_STREAM) return;
+    size_t queued = atomic_fetch_add(&gCaptureQueuedBytes, length);
+    if (queued > kCaptureQueueBudget - length) {
+        atomic_fetch_sub(&gCaptureQueuedBytes, length);
+        return;
+    }
+    @try {
+        @autoreleasepool {
+            NSMutableData *data = [NSMutableData dataWithCapacity:length];
+            size_t remaining = length;
+            for (size_t i = 0; i < count && remaining; i++) {
+                size_t part = MIN(vectors[i].iov_len, remaining);
+                if (part) [data appendBytes:vectors[i].iov_base length:part];
+                remaining -= part;
+            }
+            if (remaining) {
+                atomic_fetch_sub(&gCaptureQueuedBytes, length);
+                return;
+            }
+            dispatch_async(gCaptureQueue, ^{
+                @autoreleasepool {
+                    gCaptureDepth++;
+                    @try {
+                        muse_capture_feed(fd, data, reading);
+                    } @catch (NSException *exception) {
+                        muse_capture_close(fd);
+                        mlog(@"抓取解析异常: %@", exception.name);
+                    } @finally {
+                        gCaptureDepth--;
+                        atomic_fetch_sub(&gCaptureQueuedBytes, length);
+                    }
+                }
+            });
+        }
+    } @catch (__unused NSException *exception) {
+        atomic_fetch_sub(&gCaptureQueuedBytes, length);
+    }
+}
+
+static void muse_capture_bytes(int fd, const void *bytes, size_t length, BOOL reading) {
+    struct iovec vector = { .iov_base = (void *)bytes, .iov_len = length };
+    muse_capture_vectors(fd, &vector, 1, length, reading);
+}
+
+static void muse_capture_start(void) {
+    gCaptureQueue = dispatch_queue_create("MuseHook.capture", DISPATCH_QUEUE_SERIAL);
+    gCaptureTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, gCaptureQueue);
+    dispatch_source_set_timer(gCaptureTimer, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC),
+                              10 * NSEC_PER_SEC, NSEC_PER_SEC);
+    dispatch_source_set_event_handler(gCaptureTimer, ^{
+        @autoreleasepool {
+            gCaptureDepth++;
+            [gLock lock];
+            NSUInteger candidates = gCands.count;
+            [gLock unlock];
+            mlog(@"网络抓取 read=%llu write=%llu recv=%llu recvfrom=%llu recvmsg=%llu "
+                  "send=%llu sendto=%llu sendmsg=%llu HTTP=%lu 候选=%lu",
+                 atomic_load(&gCaptureIoCalls[MuseIoRead]), atomic_load(&gCaptureIoCalls[MuseIoWrite]),
+                 atomic_load(&gCaptureIoCalls[MuseIoRecv]), atomic_load(&gCaptureIoCalls[MuseIoRecvFrom]),
+                 atomic_load(&gCaptureIoCalls[MuseIoRecvMsg]), atomic_load(&gCaptureIoCalls[MuseIoSend]),
+                 atomic_load(&gCaptureIoCalls[MuseIoSendTo]), atomic_load(&gCaptureIoCalls[MuseIoSendMsg]),
+                 (unsigned long)gCaptureHttpMessages, (unsigned long)candidates);
+            gCaptureDepth--;
+        }
+    });
+    dispatch_resume(gCaptureTimer);
+}
+
+// 同一 dylib 内的原始符号调用由 dyld 保留，深度计数处理 libSystem 内部的嵌套调用。
+static ssize_t my_read(int fd, void *buffer, size_t length) {
+    if (!gReady) return read(fd, buffer, length);
+    BOOL outer = ++gCaptureDepth == 1;
+    ssize_t result = read(fd, buffer, length);
+    int savedErrno = errno;
+    if (outer) {
+        atomic_fetch_add(&gCaptureIoCalls[MuseIoRead], 1);
+        if (result > 0) muse_capture_bytes(fd, buffer, (size_t)result, YES);
+    }
+    gCaptureDepth--;
+    errno = savedErrno;
+    return result;
+}
+
+static ssize_t my_write(int fd, const void *buffer, size_t length) {
+    if (!gReady) return write(fd, buffer, length);
+    BOOL outer = ++gCaptureDepth == 1;
+    ssize_t result = write(fd, buffer, length);
+    int savedErrno = errno;
+    if (outer) {
+        atomic_fetch_add(&gCaptureIoCalls[MuseIoWrite], 1);
+        if (result > 0) muse_capture_bytes(fd, buffer, (size_t)result, NO);
+    }
+    gCaptureDepth--;
+    errno = savedErrno;
+    return result;
+}
+
+static ssize_t my_recv(int fd, void *buffer, size_t length, int flags) {
+    if (!gReady) return recv(fd, buffer, length, flags);
+    BOOL outer = ++gCaptureDepth == 1;
+    ssize_t result = recv(fd, buffer, length, flags);
+    int savedErrno = errno;
+    if (outer) {
+        atomic_fetch_add(&gCaptureIoCalls[MuseIoRecv], 1);
+        if (result > 0 && !(flags & MSG_PEEK)) muse_capture_bytes(fd, buffer, (size_t)result, YES);
+    }
+    gCaptureDepth--;
+    errno = savedErrno;
+    return result;
+}
+
+static ssize_t my_recvfrom(int fd, void *buffer, size_t length, int flags,
+                           struct sockaddr *address, socklen_t *addressLength) {
+    if (!gReady) return recvfrom(fd, buffer, length, flags, address, addressLength);
+    BOOL outer = ++gCaptureDepth == 1;
+    ssize_t result = recvfrom(fd, buffer, length, flags, address, addressLength);
+    int savedErrno = errno;
+    if (outer) {
+        atomic_fetch_add(&gCaptureIoCalls[MuseIoRecvFrom], 1);
+        if (result > 0 && !(flags & MSG_PEEK)) muse_capture_bytes(fd, buffer, (size_t)result, YES);
+    }
+    gCaptureDepth--;
+    errno = savedErrno;
+    return result;
+}
+
+static ssize_t my_recvmsg(int fd, struct msghdr *message, int flags) {
+    if (!gReady) return recvmsg(fd, message, flags);
+    BOOL outer = ++gCaptureDepth == 1;
+    ssize_t result = recvmsg(fd, message, flags);
+    int savedErrno = errno;
+    if (outer) {
+        atomic_fetch_add(&gCaptureIoCalls[MuseIoRecvMsg], 1);
+        if (result > 0 && !(flags & MSG_PEEK))
+            muse_capture_vectors(fd, message->msg_iov, (size_t)message->msg_iovlen, (size_t)result, YES);
+    }
+    gCaptureDepth--;
+    errno = savedErrno;
+    return result;
+}
+
+static ssize_t my_send(int fd, const void *buffer, size_t length, int flags) {
+    if (!gReady) return send(fd, buffer, length, flags);
+    BOOL outer = ++gCaptureDepth == 1;
+    ssize_t result = send(fd, buffer, length, flags);
+    int savedErrno = errno;
+    if (outer) {
+        atomic_fetch_add(&gCaptureIoCalls[MuseIoSend], 1);
+        if (result > 0) muse_capture_bytes(fd, buffer, (size_t)result, NO);
+    }
+    gCaptureDepth--;
+    errno = savedErrno;
+    return result;
+}
+
+static ssize_t my_sendto(int fd, const void *buffer, size_t length, int flags,
+                         const struct sockaddr *address, socklen_t addressLength) {
+    if (!gReady) return sendto(fd, buffer, length, flags, address, addressLength);
+    BOOL outer = ++gCaptureDepth == 1;
+    ssize_t result = sendto(fd, buffer, length, flags, address, addressLength);
+    int savedErrno = errno;
+    if (outer) {
+        atomic_fetch_add(&gCaptureIoCalls[MuseIoSendTo], 1);
+        if (result > 0) muse_capture_bytes(fd, buffer, (size_t)result, NO);
+    }
+    gCaptureDepth--;
+    errno = savedErrno;
+    return result;
+}
+
+static ssize_t my_sendmsg(int fd, const struct msghdr *message, int flags) {
+    if (!gReady) return sendmsg(fd, message, flags);
+    BOOL outer = ++gCaptureDepth == 1;
+    ssize_t result = sendmsg(fd, message, flags);
+    int savedErrno = errno;
+    if (outer) {
+        atomic_fetch_add(&gCaptureIoCalls[MuseIoSendMsg], 1);
+        if (result > 0)
+            muse_capture_vectors(fd, message->msg_iov, (size_t)message->msg_iovlen, (size_t)result, NO);
+    }
+    gCaptureDepth--;
+    errno = savedErrno;
+    return result;
+}
+
+static int my_close(int fd) {
+    if (!gReady) return close(fd);
+    BOOL outer = ++gCaptureDepth == 1;
+    int result = close(fd);
+    int savedErrno = errno;
+    if (outer && result == 0 && gCaptureQueue)
+        dispatch_async(gCaptureQueue, ^{
+            @autoreleasepool {
+                gCaptureDepth++;
+                @try { muse_capture_close(fd); }
+                @catch (__unused NSException *exception) {}
+                gCaptureDepth--;
+            }
+        });
+    gCaptureDepth--;
+    errno = savedErrno;
+    return result;
 }
 
 #define DYLD_INTERPOSE(_replacement, _replacee)                                   \
     __attribute__((used)) static struct {                                         \
         const void *replacement;                                                  \
         const void *replacee;                                                     \
-    } _interpose_##_replacee __attribute__((section("__DATA,__interpose"))) = {   \
+    } _interpose_##_replacee __attribute__((section("__DATA,__interpose"))) = {     \
         (const void *)(unsigned long)&_replacement,                               \
         (const void *)(unsigned long)&_replacee};
 
-DYLD_INTERPOSE(my_send, send)
+DYLD_INTERPOSE(my_read, read)
+DYLD_INTERPOSE(my_write, write)
 DYLD_INTERPOSE(my_recv, recv)
+DYLD_INTERPOSE(my_recvfrom, recvfrom)
+DYLD_INTERPOSE(my_recvmsg, recvmsg)
+DYLD_INTERPOSE(my_send, send)
+DYLD_INTERPOSE(my_sendto, sendto)
+DYLD_INTERPOSE(my_sendmsg, sendmsg)
+DYLD_INTERPOSE(my_close, close)
 
 // ───────────────────────── 入口 ─────────────────────────
 // constructor 里只做一件事：把初始化丢到主队列延后执行。
@@ -794,7 +1510,8 @@ static void muse_bootstrap(void) {
         gSeen = [NSMutableDictionary dictionary];
         gUnseen = 0;
         (void)out_dir();
-        mlog(@"MuseHook 已注入（手动选择模式）· 输出: %@", out_dir());
+        muse_capture_start();
+        mlog(@"MuseHook 已注入（网络抓取更新）· 输出: %@", out_dir());
         gReady = YES;
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
