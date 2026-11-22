@@ -190,14 +190,23 @@ jobs:
           @property (atomic, assign) CandStatus status;
           @property (atomic, assign) double progress;
           @property (atomic, assign) BOOL isFmp4;
+          @property (atomic, assign) double bytesPerSecond;
+          @property (atomic, assign) NSUInteger connections;
           @end
           @implementation MuseCandidate
           @end
 
           static NSString *testOutputRoot;
           static NSLock *gLock;
+          static MuseCandidate *gProgressCandidate;
+          static NSMutableArray<NSNumber *> *gProgressSamples;
           static NSString *out_dir(void) { return testOutputRoot; }
-          static void notify_list_changed(void) {}
+          static void notify_list_changed(void) {
+              if (!gProgressCandidate || !gProgressSamples) return;
+              @synchronized (gProgressSamples) {
+                  [gProgressSamples addObject:@(gProgressCandidate.progress)];
+              }
+          }
           static void mlog(NSString *format, ...) {
               va_list arguments;
               va_start(arguments, format);
@@ -256,6 +265,10 @@ jobs:
               candidate.url = [base stringByAppendingString:path];
               candidate.title = title;
               candidate.headers = headers ?: @{};
+              if ([title isEqualToString:@"resume"]) {
+                  gProgressCandidate = candidate;
+                  gProgressSamples = [NSMutableArray new];
+              }
               [[MuseDl shared] downloadCandidate:candidate];
               return candidate;
           }
@@ -302,6 +315,10 @@ jobs:
                   NSData *media = box("mdat", [@"synthetic media fixture" dataUsingEncoding:NSASCIIStringEncoding]);
                   NSData *mp4 = joined(@[type, movie, media]);
                   [mp4 writeToFile:[fixtures stringByAppendingPathComponent:@"movie.mp4"] atomically:YES];
+                  NSData *large = joined(@[type, movie, box("mdat", [NSMutableData dataWithLength:24 * 1024 * 1024])]);
+                  [large writeToFile:[fixtures stringByAppendingPathComponent:@"large.mp4"] atomically:YES];
+                  NSData *resumable = joined(@[type, movie, box("mdat", [NSMutableData dataWithLength:2 * 1024 * 1024])]);
+                  [resumable writeToFile:[fixtures stringByAppendingPathComponent:@"resume.mp4"] atomically:YES];
                   NSData *initialization = joined(@[type, movie]);
                   NSData *fragment0 = joined(@[box("moof", NSData.data), box("mdat", first)]);
                   NSData *fragment1 = joined(@[box("moof", NSData.data), box("mdat", second)]);
@@ -332,6 +349,32 @@ jobs:
                   MuseCandidate *two = download(base, @"/mp4?two", @"collision", nil);
                   require(one.status == CandDone && two.status == CandDone && finalFiles(@"collision").count == 2,
                           @"completed files must be preserved on filename collision");
+                  MuseCandidate *parallel = download(base, @"/parallel.mp4", @"parallel", nil);
+                  expectSuccess(parallel, large);
+                  require(parallel.connections == 6, @"six concurrent range transfers");
+                  NSString *peak = [NSString stringWithContentsOfFile:[fixtures stringByAppendingPathComponent:@"parallel-peak"]
+                                                            encoding:NSUTF8StringEncoding error:NULL];
+                  require(peak.integerValue >= 2, @"server observed concurrent requests");
+                  expectSuccess(download(base, @"/resume", @"resume", nil), resumable);
+                  @synchronized (gProgressSamples) {
+                      double previous = 0;
+                      for (NSNumber *sample in gProgressSamples) {
+                          require(sample.doubleValue >= previous, @"download progress moved backwards");
+                          previous = sample.doubleValue;
+                      }
+                  }
+                  NSString *ranges = [NSString stringWithContentsOfFile:[fixtures stringByAppendingPathComponent:@"resume-ranges.jsonl"]
+                                                              encoding:NSUTF8StringEncoding error:NULL];
+                  NSUInteger requests = 0;
+                  NSUInteger restarts = 0;
+                  for (NSString *line in [ranges componentsSeparatedByString:@"\n"]) {
+                      if (!line.length) continue;
+                      NSDictionary *entry = [NSJSONSerialization JSONObjectWithData:[line dataUsingEncoding:NSUTF8StringEncoding] options:0 error:NULL];
+                      requests++;
+                      if ([entry[@"start"] unsignedLongLongValue] == 0) restarts++;
+                  }
+                  require(requests >= 6 && restarts == 1, @"retries used resume offsets rather than restarting");
+                  puts("PASS: six-way range downloading, repeated interruption resume and monotonic progress");
                   puts("PASS: download fixtures (redirects, headers, MP4, AES sequence, missing pieces, ranges, false-200 and file publication)");
               }
               return 0;
@@ -343,12 +386,20 @@ jobs:
           from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
           from pathlib import Path
           import re
+          import json
+          import socket
+          import threading
+          import time
 
 
           parser = argparse.ArgumentParser()
           parser.add_argument("--fixtures", type=Path, required=True)
           parser.add_argument("--port-file", type=Path, required=True)
           args = parser.parse_args()
+          state_lock = threading.Lock()
+          resume_drops = 0
+          parallel_active = 0
+          parallel_peak = 0
 
 
           class Handler(BaseHTTPRequestHandler):
@@ -371,7 +422,57 @@ jobs:
                   return (args.fixtures / name).read_bytes()
 
               def do_GET(self):
+                  global resume_drops, parallel_active, parallel_peak
                   path = self.path.split("?", 1)[0]
+                  if path in ("/parallel.mp4", "/resume"):
+                      body = self.fixture("large.mp4" if path == "/parallel.mp4" else "resume.mp4")
+                      match = re.fullmatch(r"bytes=(\d+)-(\d*)", self.headers.get("Range", ""))
+                      start = int(match.group(1)) if match else 0
+                      end = int(match.group(2)) if match and match.group(2) else len(body) - 1
+                      end = min(end, len(body) - 1)
+                      selected = body[start:end + 1]
+                      extra = {"Accept-Ranges": "bytes", "ETag": '"fixture-stable-v1"'}
+                      if match:
+                          extra["Content-Range"] = f"bytes {start}-{end}/{len(body)}"
+                      if path == "/resume" and match and end == 0:
+                          self.send(selected, "application/octet-stream", 206, extra)
+                          return
+                      if path == "/parallel.mp4":
+                          with state_lock:
+                              parallel_active += 1
+                              parallel_peak = max(parallel_peak, parallel_active)
+                              (args.fixtures / "parallel-peak").write_text(str(parallel_peak))
+                          try:
+                              time.sleep(0.1)
+                              self.send(selected, "video/mp4", 206 if match else 200, extra)
+                          finally:
+                              with state_lock:
+                                  parallel_active -= 1
+                          return
+                      with state_lock:
+                          with (args.fixtures / "resume-ranges.jsonl").open("a") as output:
+                              output.write(json.dumps({"start": start, "range": bool(match)}) + "\n")
+                          drop = resume_drops < 5
+                          if drop:
+                              resume_drops += 1
+                      if drop:
+                          self.send_response(206 if match else 200)
+                          self.send_header("Content-Type", "video/mp4")
+                          self.send_header("Content-Length", str(len(selected)))
+                          for name, value in extra.items():
+                              self.send_header(name, value)
+                          self.end_headers()
+                          amount = min(len(selected), 131072)
+                          for offset in range(0, amount, 32768):
+                              self.wfile.write(selected[offset:offset + 32768])
+                              self.wfile.flush()
+                              time.sleep(0.02)
+                          self.close_connection = True
+                          self.connection.shutdown(socket.SHUT_RDWR)
+                          self.connection.close()
+                      else:
+                          self.send(selected, "video/mp4", 206 if match else 200, extra)
+                      return
                   if path.startswith("/headers/"):
                       if (self.headers.get("Authorization") != "Bearer fixture" or
                               self.headers.get("User-Agent") != "FixturePlayer"):

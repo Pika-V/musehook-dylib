@@ -84,6 +84,8 @@ typedef NS_ENUM(NSInteger, CandStatus) {
 @property (atomic, assign) CandStatus status;
 @property (atomic, assign) double progress;   // 0~1
 @property (atomic, assign) BOOL isFmp4;
+@property (atomic, assign) double bytesPerSecond;
+@property (atomic, assign) NSUInteger connections;
 @property (atomic, copy) NSDictionary<NSString *, NSString *> *headers;
 @property (atomic, copy) NSString *errorText;
 @end
@@ -234,11 +236,21 @@ static BOOL muse_copy_file_range(NSURL *source, NSURL *destination, uint64_t off
 @property (nonatomic, assign) uint64_t offset;
 @property (nonatomic, assign) uint64_t length;
 @property (nonatomic, assign) NSTimeInterval lastProgress;
+@property (nonatomic, assign) NSTimeInterval startedAt;
+@property (nonatomic, copy) NSData *resumeData;
+@property (nonatomic, assign) BOOL resuming;
+@property (nonatomic, assign) int64_t resumeOffset;
+@property (nonatomic, assign) int64_t receivedBytes;
+@property (nonatomic, assign) int64_t expectedBytes;
+@property (nonatomic, assign) BOOL probe;
+@property (nonatomic, assign) BOOL strictRange;
+@property (nonatomic, assign) uint64_t totalLength;
+@property (nonatomic, copy) void (^progressHandler)(int64_t bytes);
 @end
 @implementation MuseDownloadJob
 @end
 
-@interface MuseDl : NSObject <NSURLSessionDownloadDelegate>
+@interface MuseDl : NSObject <NSURLSessionDownloadDelegate, NSURLSessionDataDelegate>
 @property (nonatomic, strong) NSURLSession *session;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, MuseDownloadJob *> *jobs;
 @property (nonatomic, strong) NSLock *jobsLock;
@@ -259,7 +271,7 @@ static BOOL muse_copy_file_range(NSURL *source, NSURL *destination, uint64_t off
         _jobsLock = [NSLock new];
         _filesLock = [NSLock new];
         NSURLSessionConfiguration *configuration = NSURLSessionConfiguration.defaultSessionConfiguration;
-        configuration.timeoutIntervalForRequest = 30;
+        configuration.timeoutIntervalForRequest = 90;
         configuration.timeoutIntervalForResource = 7200;
         configuration.HTTPMaximumConnectionsPerHost = 6;
         _session = [NSURLSession sessionWithConfiguration:configuration delegate:self delegateQueue:nil];
@@ -302,23 +314,52 @@ static BOOL muse_copy_file_range(NSURL *source, NSURL *destination, uint64_t off
         [request setValue:[NSString stringWithFormat:@"bytes=%llu-%llu",
                           (unsigned long long)start, (unsigned long long)(start + length - 1)]
        forHTTPHeaderField:@"Range"];
+        [request setValue:@"identity" forHTTPHeaderField:@"Accept-Encoding"];
+        if ([range[@"validator"] length])
+            [request setValue:range[@"validator"] forHTTPHeaderField:@"If-Range"];
     }
     return request;
 }
 
 - (MuseDownloadJob *)fetchURL:(NSURL *)url candidate:(MuseCandidate *)candidate range:(NSDictionary *)range
                    directory:(NSURL *)directory showProgress:(BOOL)showProgress {
+    return [self fetchURL:url candidate:candidate range:range directory:directory
+             showProgress:showProgress progress:nil];
+}
+
+- (MuseDownloadJob *)fetchURL:(NSURL *)url candidate:(MuseCandidate *)candidate range:(NSDictionary *)range
+                   directory:(NSURL *)directory showProgress:(BOOL)showProgress
+                    progress:(void (^)(int64_t))progressHandler {
     MuseDownloadJob *last = nil;
-    for (NSUInteger attempt = 0; attempt < 3; attempt++) {
+    NSData *resumeData = nil;
+    int64_t furthest = 0;
+    int64_t expectedBytes = 0;
+    NSUInteger stalled = 0;
+    NSUInteger attempt = 0;
+    NSTimeInterval deadline = NSDate.timeIntervalSinceReferenceDate + 7200;
+    while (stalled < 3 && NSDate.timeIntervalSinceReferenceDate < deadline) {
+        attempt++;
         MuseDownloadJob *job = [MuseDownloadJob new];
         job.done = dispatch_semaphore_create(0);
+        job.startedAt = NSDate.timeIntervalSinceReferenceDate;
         job.destination = [directory URLByAppendingPathComponent:NSUUID.UUID.UUIDString];
         job.candidate = showProgress ? candidate : nil;
         job.hasRange = range != nil;
         job.offset = [range[@"offset"] unsignedLongLongValue];
         job.length = [range[@"length"] unsignedLongLongValue];
-        NSURLSessionDownloadTask *task = [self.session downloadTaskWithRequest:
-                                         [self requestForURL:url candidate:candidate range:range]];
+        job.resuming = resumeData.length > 0;
+        job.expectedBytes = expectedBytes;
+        job.strictRange = [range[@"strict"] boolValue];
+        job.totalLength = [range[@"total"] unsignedLongLongValue];
+        job.progressHandler = progressHandler;
+        NSURLSessionDownloadTask *task;
+        if (job.resuming) {
+            task = [self.session downloadTaskWithResumeData:resumeData];
+            mlog(@"断点续传 %@，第 %lu 次请求，已接收 %lld 字节", candidate.title,
+                 (unsigned long)attempt, (long long)furthest);
+        } else {
+            task = [self.session downloadTaskWithRequest:[self requestForURL:url candidate:candidate range:range]];
+        }
         [self.jobsLock lock];
         self.jobs[@(task.taskIdentifier)] = job;
         [self.jobsLock unlock];
@@ -326,10 +367,29 @@ static BOOL muse_copy_file_range(NSURL *source, NSURL *destination, uint64_t off
         dispatch_semaphore_wait(job.done, DISPATCH_TIME_FOREVER);
         last = job;
         if (!job.error) return job;
+        int64_t position = job.resumeOffset + job.receivedBytes;
+        mlog(@"下载请求中断 %@，%@/%ld，位置 %lld，原因 %@",
+             candidate.title, job.error.domain, (long)job.error.code,
+             (long long)position, job.error.localizedDescription);
+        if (showProgress) candidate.errorText = [NSString stringWithFormat:@"续传中：%@", job.error.localizedDescription];
         [NSFileManager.defaultManager removeItemAtURL:job.destination error:NULL];
         NSInteger status = job.response.statusCode;
         if (status >= 400 && status < 500 && status != 408 && status != 429) break;
         if ([job.error.domain isEqualToString:@"MuseHook.Download"] && status < 500) break;
+        if (position > furthest) {
+            furthest = position;
+            stalled = 0;
+        } else {
+            stalled++;
+        }
+        expectedBytes = job.expectedBytes;
+        resumeData = range ? nil : job.resumeData;
+        if (!range && position > 0 && !resumeData.length) {
+            job.error = muse_download_error(40, [NSString stringWithFormat:@"连接中断且没有可用的续传数据：%@",
+                                                job.error.localizedDescription]);
+            break;
+        }
+        if (range) stalled = attempt;
     }
     return last;
 }
@@ -338,13 +398,42 @@ static BOOL muse_copy_file_range(NSURL *source, NSURL *destination, uint64_t off
  didWriteData:(int64_t)bytesWritten totalBytesWritten:(int64_t)totalBytesWritten
  totalBytesExpectedToWrite:(int64_t)expected {
     MuseDownloadJob *job = [self jobForTask:task];
-    if (job.candidate && expected > 0) {
+    if (!job) return;
+    if (job.strictRange && [task.response isKindOfClass:NSHTTPURLResponse.class] &&
+        [(NSHTTPURLResponse *)task.response statusCode] != 206) {
+        job.error = muse_download_error(41, @"服务器未接受分块请求，改用单连接");
+        [task cancel];
+        return;
+    }
+    job.receivedBytes += MAX(bytesWritten, (int64_t)0);
+    if (!job.resuming || job.expectedBytes <= 0) job.expectedBytes = expected;
+    if (job.candidate || job.progressHandler) {
         NSTimeInterval now = NSDate.timeIntervalSinceReferenceDate;
         if (now - job.lastProgress < 0.2) return;
         job.lastProgress = now;
-        job.candidate.progress = MIN(0.95, (double)totalBytesWritten / (double)expected);
-        notify_list_changed();
+        int64_t position = job.resumeOffset + job.receivedBytes;
+        if (job.progressHandler) job.progressHandler(position);
+        if (job.candidate && job.expectedBytes > 0) {
+            double progress = (double)position / (double)job.expectedBytes;
+            NSString *mime = task.response.MIMEType.lowercaseString;
+            BOOL playlist = [mime containsString:@"mpegurl"] ||
+                            [task.currentRequest.URL.path.pathExtension.lowercaseString isEqualToString:@"m3u8"];
+            double value = playlist ? 0.05 * MIN(1.0, progress) : MIN(0.95, progress);
+            job.candidate.progress = MAX(job.candidate.progress, value);
+            job.candidate.bytesPerSecond = (double)job.receivedBytes / MAX(0.2, now - job.startedAt);
+            notify_list_changed();
+        }
     }
+}
+
+- (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)task
+ didResumeAtOffset:(int64_t)offset expectedTotalBytes:(int64_t)expected {
+    MuseDownloadJob *job = [self jobForTask:task];
+    if (!job) return;
+    job.resumeOffset = offset;
+    if (expected > 0) job.expectedBytes = expected;
+    mlog(@"续传位置确认 %@：%lld / %lld 字节", job.candidate.title ?: @"分片",
+         (long long)offset, (long long)job.expectedBytes);
 }
 
 - (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)task
@@ -388,9 +477,13 @@ static BOOL muse_copy_file_range(NSURL *source, NSURL *destination, uint64_t off
                          muse_download_number([header substringWithRange:[match rangeAtIndex:2]], &end) && end >= start;
             if (valid && job.hasRange) {
                 valid = start == job.offset && end - start + 1 == job.length && fileLength == job.length;
+                if (job.strictRange) {
+                    valid &= muse_download_number([header substringWithRange:[match rangeAtIndex:3]], &total) &&
+                             total == job.totalLength;
+                }
             } else if (valid) {
                 valid = muse_download_number([header substringWithRange:[match rangeAtIndex:3]], &total) &&
-                        start == 0 && total > 0 && end == total - 1 && fileLength == total;
+                        start == (uint64_t)job.resumeOffset && total > 0 && end == total - 1 && fileLength == total;
             }
             if (!valid) {
                 job.error = muse_download_error(5, @"服务器仅返回了不完整的内容范围");
@@ -408,8 +501,14 @@ static BOOL muse_copy_file_range(NSURL *source, NSURL *destination, uint64_t off
     MuseDownloadJob *job = [self jobForTask:task];
     if (!job) return;
     @try {
-        if (error) job.error = error;
-        if (!job.error && ![NSFileManager.defaultManager fileExistsAtPath:job.destination.path])
+        if (error) {
+            if (!job.error) job.error = error;
+            id data = error.userInfo[NSURLSessionDownloadTaskResumeData];
+            if ([data isKindOfClass:NSData.class]) job.resumeData = data;
+            if ([task.response isKindOfClass:NSHTTPURLResponse.class]) job.response = (id)task.response;
+        }
+        if (job.probe && job.response && error.code == NSURLErrorCancelled) job.error = nil;
+        if (!job.probe && !job.error && ![NSFileManager.defaultManager fileExistsAtPath:job.destination.path])
             job.error = muse_download_error(6, @"没有收到下载文件");
     } @catch (NSException *exception) {
         job.error = muse_download_error(34, exception.reason ?: @"下载完成处理失败");
@@ -767,6 +866,9 @@ static BOOL muse_copy_file_range(NSURL *source, NSURL *destination, uint64_t off
     for (NSUInteger index = 0; index < pieces.count; index++) [files addObject:NSNull.null];
     __block NSError *firstError = nil;
     __block NSUInteger completed = 0;
+    __block uint64_t downloaded = 0;
+    NSTimeInterval assemblyStarted = NSDate.timeIntervalSinceReferenceDate;
+    candidate.connections = MIN((NSUInteger)6, pieces.count);
     for (NSUInteger index = 0; index < pieces.count; index++) {
         [workers addOperationWithBlock:^{
             @autoreleasepool {
@@ -796,7 +898,10 @@ static BOOL muse_copy_file_range(NSURL *source, NSURL *destination, uint64_t off
                 if (pieceError && !firstError) firstError = pieceError;
                 if (!pieceError) files[index] = file;
                 completed++;
-                candidate.progress = 0.95 * (double)completed / (double)pieces.count;
+                if (!pieceError)
+                    downloaded += [[NSFileManager.defaultManager attributesOfItemAtPath:file.path error:NULL][NSFileSize] unsignedLongLongValue];
+                candidate.progress = MAX(candidate.progress, 0.05 + 0.90 * (double)completed / (double)pieces.count);
+                candidate.bytesPerSecond = (double)downloaded / MAX(0.2, NSDate.timeIntervalSinceReferenceDate - assemblyStarted);
                 [resultsLock unlock];
                 notify_list_changed();
             }
@@ -804,6 +909,59 @@ static BOOL muse_copy_file_range(NSURL *source, NSURL *destination, uint64_t off
     }
     [workers waitUntilAllOperationsAreFinished];
     if (firstError) { if (error) *error = firstError; return nil; }
+    return [self mergeFiles:files directory:directory error:error];
+}
+
+- (NSURL *)commitFile:(NSURL *)staged directory:(NSURL *)directory name:(NSString *)name
+            extension:(NSString *)extension error:(NSError **)error {
+    [self.filesLock lock];
+    NSURL *destination = nil;
+    @try {
+        NSUInteger suffix = 1;
+        do {
+            NSString *filename = suffix == 1 ? [name stringByAppendingPathExtension:extension] :
+                [[NSString stringWithFormat:@"%@ (%lu)", name, (unsigned long)suffix] stringByAppendingPathExtension:extension];
+            destination = [directory URLByAppendingPathComponent:filename];
+            suffix++;
+        } while ([NSFileManager.defaultManager fileExistsAtPath:destination.path]);
+        if (![NSFileManager.defaultManager moveItemAtURL:staged toURL:destination error:error]) destination = nil;
+    } @finally { [self.filesLock unlock]; }
+    return destination;
+}
+
+- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)task
+ didReceiveResponse:(NSURLResponse *)response
+ completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
+    MuseDownloadJob *job = [self jobForTask:task];
+    if (job.probe) {
+        job.response = [response isKindOfClass:NSHTTPURLResponse.class] ? (id)response : nil;
+    }
+    completionHandler(NSURLSessionResponseCancel);
+}
+
+- (MuseDownloadJob *)probeURL:(NSURL *)url candidate:(MuseCandidate *)candidate {
+    MuseDownloadJob *job = [MuseDownloadJob new];
+    job.probe = YES;
+    job.done = dispatch_semaphore_create(0);
+    NSMutableURLRequest *request = [self requestForURL:url candidate:candidate
+                                              range:@{@"offset": @0, @"length": @1}];
+    NSURLSessionDataTask *task = [self.session dataTaskWithRequest:request];
+    [self.jobsLock lock];
+    self.jobs[@(task.taskIdentifier)] = job;
+    [self.jobsLock unlock];
+    [task resume];
+    dispatch_semaphore_wait(job.done, DISPATCH_TIME_FOREVER);
+    return job;
+}
+
+- (NSString *)header:(NSString *)name response:(NSHTTPURLResponse *)response {
+    for (NSString *key in response.allHeaderFields) {
+        if ([key caseInsensitiveCompare:name] == NSOrderedSame) return [response.allHeaderFields[key] description];
+    }
+    return nil;
+}
+
+- (NSURL *)mergeFiles:(NSArray<NSURL *> *)files directory:(NSURL *)directory error:(NSError **)error {
     NSURL *merged = [directory URLByAppendingPathComponent:@"merged"];
     [NSFileManager.defaultManager createFileAtPath:merged.path contents:nil attributes:nil];
     NSFileHandle *output = [NSFileHandle fileHandleForWritingToURL:merged error:error];
@@ -825,26 +983,92 @@ static BOOL muse_copy_file_range(NSURL *source, NSURL *destination, uint64_t off
         }
     } @catch (NSException *exception) {
         success = NO;
-        if (error) *error = muse_download_error(27, exception.reason ?: @"分片合并失败");
+        if (error) *error = muse_download_error(27, exception.reason ?: @"分块合并失败");
     } @finally { [output closeFile]; }
     return success ? merged : nil;
 }
 
-- (NSURL *)commitFile:(NSURL *)staged directory:(NSURL *)directory name:(NSString *)name
-            extension:(NSString *)extension error:(NSError **)error {
-    [self.filesLock lock];
-    NSURL *destination = nil;
-    @try {
-        NSUInteger suffix = 1;
-        do {
-            NSString *filename = suffix == 1 ? [name stringByAppendingPathExtension:extension] :
-                [[NSString stringWithFormat:@"%@ (%lu)", name, (unsigned long)suffix] stringByAppendingPathExtension:extension];
-            destination = [directory URLByAppendingPathComponent:filename];
-            suffix++;
-        } while ([NSFileManager.defaultManager fileExistsAtPath:destination.path]);
-        if (![NSFileManager.defaultManager moveItemAtURL:staged toURL:destination error:error]) destination = nil;
-    } @finally { [self.filesLock unlock]; }
-    return destination;
+- (NSURL *)parallelMP4:(NSHTTPURLResponse *)response candidate:(MuseCandidate *)candidate
+             directory:(NSURL *)directory error:(NSError **)error {
+    if (response.statusCode != 206) return nil;
+    NSString *contentRange = [self header:@"Content-Range" response:response];
+    static NSRegularExpression *pattern;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        pattern = [NSRegularExpression regularExpressionWithPattern:@"^bytes 0-0/([0-9]+)$" options:0 error:NULL];
+    });
+    NSTextCheckingResult *match = [pattern firstMatchInString:contentRange ?: @"" options:0
+                                                      range:NSMakeRange(0, contentRange.length)];
+    uint64_t total = 0;
+    if (!match || !muse_download_number([contentRange substringWithRange:[match rangeAtIndex:1]], &total) ||
+        total <= 8 * 1024 * 1024 || total > INT64_MAX) return nil;
+    NSString *mime = response.MIMEType.lowercaseString;
+    if (![mime isEqualToString:@"video/mp4"] &&
+        ![response.URL.path.pathExtension.lowercaseString isEqualToString:@"mp4"]) return nil;
+    NSString *validator = [self header:@"ETag" response:response];
+    if (!validator.length || [validator hasPrefix:@"W/"]) validator = [self header:@"Last-Modified" response:response];
+    uint64_t chunkSize = 4 * 1024 * 1024;
+    NSUInteger count = (NSUInteger)((total + chunkSize - 1) / chunkSize);
+    NSUInteger connections = MIN((NSUInteger)6, count);
+    candidate.connections = connections;
+    mlog(@"并发下载 %@：%lu 路，%llu 字节，%lu 个分块", candidate.title, (unsigned long)connections,
+         (unsigned long long)total, (unsigned long)count);
+    NSOperationQueue *workers = [NSOperationQueue new];
+    workers.maxConcurrentOperationCount = connections;
+    NSLock *lock = [NSLock new];
+    NSMutableArray *files = [NSMutableArray arrayWithCapacity:count];
+    NSMutableArray<NSNumber *> *written = [NSMutableArray arrayWithCapacity:count];
+    for (NSUInteger index = 0; index < count; index++) {
+        [files addObject:NSNull.null];
+        [written addObject:@0];
+    }
+    __block NSError *firstError = nil;
+    NSTimeInterval started = NSDate.timeIntervalSinceReferenceDate;
+    void (^update)(NSUInteger, uint64_t) = ^(NSUInteger index, uint64_t amount) {
+        [lock lock];
+        written[index] = @(MAX(written[index].unsignedLongLongValue, amount));
+        uint64_t received = 0;
+        for (NSNumber *bytes in written) received += bytes.unsignedLongLongValue;
+        candidate.progress = MAX(candidate.progress, 0.95 * (double)received / (double)total);
+        candidate.bytesPerSecond = (double)received / MAX(0.2, NSDate.timeIntervalSinceReferenceDate - started);
+        [lock unlock];
+        notify_list_changed();
+    };
+    for (NSUInteger index = 0; index < count; index++) {
+        uint64_t offset = (uint64_t)index * chunkSize;
+        uint64_t length = MIN(chunkSize, total - offset);
+        [workers addOperationWithBlock:^{
+            @autoreleasepool {
+                NSDictionary *range = @{@"offset": @(offset), @"length": @(length), @"strict": @YES,
+                                        @"total": @(total), @"validator": validator ?: @""};
+                MuseDownloadJob *job = nil;
+                NSError *chunkError = nil;
+                @try {
+                    job = [self fetchURL:response.URL candidate:candidate range:range directory:directory
+                             showProgress:NO progress:^(int64_t bytes) {
+                        update(index, MIN(length, (uint64_t)MAX(bytes, (int64_t)0)));
+                    }];
+                    chunkError = job.error;
+                } @catch (NSException *exception) {
+                    chunkError = muse_download_error(43, exception.reason ?: @"分块下载失败");
+                }
+                [lock lock];
+                if (chunkError && !firstError) firstError = chunkError;
+                if (!chunkError) files[index] = job.destination;
+                [lock unlock];
+                if (!chunkError) update(index, length);
+            }
+        }];
+    }
+    [workers waitUntilAllOperationsAreFinished];
+    if (firstError) { if (error) *error = firstError; return nil; }
+    NSURL *merged = [self mergeFiles:files directory:directory error:error];
+    uint64_t length = [[NSFileManager.defaultManager attributesOfItemAtPath:merged.path error:NULL][NSFileSize] unsignedLongLongValue];
+    if (merged && (length != total || ![self isMP4AtURL:merged])) {
+        if (error) *error = muse_download_error(42, @"分块合并后的 MP4 不完整");
+        return nil;
+    }
+    return merged;
 }
 
 - (void)downloadCandidate:(MuseCandidate *)candidate {
@@ -856,6 +1080,8 @@ static BOOL muse_copy_file_range(NSURL *source, NSURL *destination, uint64_t off
             candidate.status = CandRunning;
             candidate.errorText = nil;
             candidate.progress = 0;
+            candidate.bytesPerSecond = 0;
+            candidate.connections = 1;
             notify_list_changed();
             NSString *safe = [[candidate.title componentsSeparatedByCharactersInSet:
                               [NSCharacterSet characterSetWithCharactersInString:@"/\\:*?\"<>|\n\r"]]
@@ -871,41 +1097,51 @@ static BOOL muse_copy_file_range(NSURL *source, NSURL *destination, uint64_t off
                 @throw [NSException exceptionWithName:@"MuseDownload" reason:error.localizedDescription userInfo:nil];
             NSURL *url = muse_hls_url(candidate.url, nil);
             if (!url) @throw [NSException exceptionWithName:@"MuseDownload" reason:@"播放地址无效" userInfo:nil];
-            MuseDownloadJob *root = [self fetchURL:url candidate:candidate range:nil directory:working showProgress:YES];
-            if (root.error) error = root.error;
-            NSURL *mediaFile = nil;
-            NSString *extension = @"mp4";
-            if (!error && [self isMP4AtURL:root.destination]) {
+            MuseDownloadJob *probe = [self probeURL:url candidate:candidate];
+            NSURL *parallel = [self parallelMP4:probe.response candidate:candidate directory:working error:&error];
+            if (parallel) {
                 candidate.isFmp4 = YES;
-                mediaFile = root.destination;
-            } else if (!error) {
-                NSString *text = [self playlistAtURL:root.destination error:&error];
-                NSURL *base = root.response.URL;
-                NSMutableSet *visited = [NSMutableSet set];
-                for (NSUInteger depth = 0; text && [text containsString:@"#EXT-X-STREAM-INF:"] && depth < 5; depth++) {
-                    NSURL *variant = [self variantFromPlaylist:text base:base error:&error];
-                    if (!variant || [visited containsObject:variant.absoluteString]) {
-                        if (!error) error = muse_download_error(28, @"播放列表循环引用");
-                        text = nil;
-                        break;
+                completed = [self commitFile:parallel directory:directory name:safe extension:@"mp4" error:&error];
+            } else {
+                if ([error.domain isEqualToString:@"MuseHook.Download"] && error.code == 41) error = nil;
+                if (error) @throw [NSException exceptionWithName:@"MuseDownload" reason:error.localizedDescription userInfo:nil];
+                candidate.connections = 1;
+                MuseDownloadJob *root = [self fetchURL:url candidate:candidate range:nil directory:working showProgress:YES];
+                if (root.error) error = root.error;
+                NSURL *mediaFile = nil;
+                NSString *extension = @"mp4";
+                if (!error && [self isMP4AtURL:root.destination]) {
+                    candidate.isFmp4 = YES;
+                    mediaFile = root.destination;
+                } else if (!error) {
+                    NSString *text = [self playlistAtURL:root.destination error:&error];
+                    NSURL *base = root.response.URL;
+                    NSMutableSet *visited = [NSMutableSet set];
+                    for (NSUInteger depth = 0; text && [text containsString:@"#EXT-X-STREAM-INF:"] && depth < 5; depth++) {
+                        NSURL *variant = [self variantFromPlaylist:text base:base error:&error];
+                        if (!variant || [visited containsObject:variant.absoluteString]) {
+                            if (!error) error = muse_download_error(28, @"播放列表循环引用");
+                            text = nil;
+                            break;
+                        }
+                        [visited addObject:variant.absoluteString];
+                        MuseDownloadJob *next = [self fetchURL:variant candidate:candidate range:nil directory:working showProgress:NO];
+                        if (next.error) { error = next.error; text = nil; break; }
+                        base = next.response.URL;
+                        text = [self playlistAtURL:next.destination error:&error];
                     }
-                    [visited addObject:variant.absoluteString];
-                    MuseDownloadJob *next = [self fetchURL:variant candidate:candidate range:nil directory:working showProgress:NO];
-                    if (next.error) { error = next.error; text = nil; break; }
-                    base = next.response.URL;
-                    text = [self playlistAtURL:next.destination error:&error];
+                    if (text && [text containsString:@"#EXT-X-STREAM-INF:"]) {
+                        error = muse_download_error(29, @"播放列表嵌套过深");
+                        text = nil;
+                    }
+                    BOOL fmp4 = NO;
+                    NSArray *pieces = text ? [self piecesFromPlaylist:text base:base fmp4:&fmp4 error:&error] : nil;
+                    candidate.isFmp4 = fmp4;
+                    extension = fmp4 ? @"mp4" : @"ts";
+                    if (pieces) mediaFile = [self assemblePieces:pieces candidate:candidate directory:working error:&error];
                 }
-                if (text && [text containsString:@"#EXT-X-STREAM-INF:"]) {
-                    error = muse_download_error(29, @"播放列表嵌套过深");
-                    text = nil;
-                }
-                BOOL fmp4 = NO;
-                NSArray *pieces = text ? [self piecesFromPlaylist:text base:base fmp4:&fmp4 error:&error] : nil;
-                candidate.isFmp4 = fmp4;
-                extension = fmp4 ? @"mp4" : @"ts";
-                if (pieces) mediaFile = [self assemblePieces:pieces candidate:candidate directory:working error:&error];
+                if (mediaFile && !error) completed = [self commitFile:mediaFile directory:directory name:safe extension:extension error:&error];
             }
-            if (mediaFile && !error) completed = [self commitFile:mediaFile directory:directory name:safe extension:extension error:&error];
         } @catch (NSException *exception) {
             if (!error) error = muse_download_error(30, exception.reason ?: @"下载失败");
         } @finally {
@@ -973,6 +1209,9 @@ static NSString *muse_diagnostic_report(void);
 - (void)showDiagnostics {
     NSString *report = muse_diagnostic_report();
     for (MuseCandidate *candidate in cand_snapshot()) {
+        if (candidate.status == CandRunning)
+            report = [report stringByAppendingFormat:@"\n下载 %.0f%%，%.0f KB/s，%lu路",
+                      candidate.progress * 100, candidate.bytesPerSecond / 1024, (unsigned long)candidate.connections];
         if (candidate.errorText.length) {
             report = [report stringByAppendingFormat:@"\n下载错误 %@", candidate.errorText];
             break;
@@ -1068,7 +1307,13 @@ static NSString *muse_diagnostic_report(void);
     NSString *state = @"";
     switch (c.status) {
         case CandIdle:    state = @"待选"; break;
-        case CandRunning: state = [NSString stringWithFormat:@"下载中 %.0f%%", c.progress * 100]; break;
+        case CandRunning: {
+            NSString *speed = c.bytesPerSecond >= 1024 * 1024
+                ? [NSString stringWithFormat:@"%.1f MB/s", c.bytesPerSecond / (1024 * 1024)]
+                : [NSString stringWithFormat:@"%.0f KB/s", c.bytesPerSecond / 1024];
+            state = [NSString stringWithFormat:@"下载中 %.0f%% %@ %lu路", c.progress * 100, speed, (unsigned long)c.connections];
+            break;
+        }
         case CandDone:    state = @"✅ 已完成"; break;
         case CandFailed:  state = @"❌ 失败（可重试）"; break;
     }
@@ -1440,7 +1685,7 @@ static NSString *muse_diagnostic_report(void) {
     }
     NSString *logPath = gLogPath ?: [out_dir() stringByAppendingPathComponent:@"hook.log"];
     return [NSString stringWithFormat:
-        @"MuseHook 播放器抓取版\n观察点 %lu/5\n播放器调用 %lu\n播放地址 %lu\n最近入口 %@\n最近地址 %@\n日志 %@",
+        @"MuseHook 播放器抓取版 · 分块续传\n观察点 %lu/5\n播放器调用 %lu\n播放地址 %lu\n最近入口 %@\n最近地址 %@\n日志 %@",
         (unsigned long)atomic_load(&gMediaHooksInstalled),
         (unsigned long)atomic_load(&gMediaCallsObserved),
         (unsigned long)atomic_load(&gMediaURLsObserved),
