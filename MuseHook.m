@@ -831,7 +831,7 @@ static BOOL muse_capture_valid_url(NSString *value) {
 static BOOL muse_capture_hls_url(NSString *value) {
     if (!muse_capture_valid_url(value)) return NO;
     NSURLComponents *parts = [NSURLComponents componentsWithString:value];
-    NSString *filename = [parts.path.lastPathComponent componentsSeparatedByString:@";"].firstObject;
+    NSString *filename = [parts.percentEncodedPath.lastPathComponent componentsSeparatedByString:@";"].firstObject;
     return [filename.pathExtension.lowercaseString isEqualToString:@"m3u8"];
 }
 
