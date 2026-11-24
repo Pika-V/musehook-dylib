@@ -1114,10 +1114,11 @@ static NSString *muse_video_basename(NSString *value) {
             if (!safe.length || [safe isEqualToString:@"."] || [safe isEqualToString:@".."]) safe = @"MuseVideo";
             if (safe.length > 60) safe = [safe substringWithRange:[safe rangeOfComposedCharacterSequencesForRange:NSMakeRange(0, 60)]];
             if ([safe lengthOfBytesUsingEncoding:NSUTF8StringEncoding] > 180) safe = @"MuseVideo";
-            NSURL *directory = [NSURL fileURLWithPath:[out_dir() stringByAppendingPathComponent:safe] isDirectory:YES];
+            NSURL *directory = [NSURL fileURLWithPath:out_dir() isDirectory:YES];
             if (![NSFileManager.defaultManager createDirectoryAtURL:directory withIntermediateDirectories:YES attributes:nil error:&error])
                 @throw [NSException exceptionWithName:@"MuseDownload" reason:error.localizedDescription userInfo:nil];
-            working = [directory URLByAppendingPathComponent:[@".work-" stringByAppendingString:NSUUID.UUID.UUIDString] isDirectory:YES];
+            NSURL *temporaryDirectory = [NSURL fileURLWithPath:NSTemporaryDirectory() isDirectory:YES];
+            working = [temporaryDirectory URLByAppendingPathComponent:[@"MuseHook-" stringByAppendingString:NSUUID.UUID.UUIDString] isDirectory:YES];
             if (![NSFileManager.defaultManager createDirectoryAtURL:working withIntermediateDirectories:NO attributes:nil error:&error])
                 @throw [NSException exceptionWithName:@"MuseDownload" reason:error.localizedDescription userInfo:nil];
             NSURL *parallel = [self parallelMP4:probe.response candidate:candidate directory:working error:&error];

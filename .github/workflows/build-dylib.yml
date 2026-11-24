@@ -274,10 +274,12 @@ jobs:
           }
 
           static NSArray<NSString *> *finalFiles(NSString *title) {
-              NSString *directory = [testOutputRoot stringByAppendingPathComponent:title];
+              NSString *directory = testOutputRoot;
               NSMutableArray *paths = [NSMutableArray array];
               for (NSString *name in [NSFileManager.defaultManager contentsOfDirectoryAtPath:directory error:NULL]) {
-                  if ([@[@"ts", @"mp4"] containsObject:name.pathExtension])
+                  NSString *stem = name.stringByDeletingPathExtension;
+                  BOOL matchingName = [stem isEqualToString:title] || [stem hasPrefix:[title stringByAppendingString:@" ("]];
+                  if (matchingName && [@[@"ts", @"mp4"] containsObject:name.pathExtension])
                       [paths addObject:[directory stringByAppendingPathComponent:name]];
               }
               return paths;
@@ -345,8 +347,13 @@ jobs:
                   expectSuccess(download(base, @"/mp4", @"direct", nil), mp4);
                   MuseCandidate *named = download(base, @"/names/MIDV-530-LXT.mp4?token=fixture", @"候选 99", nil);
                   require(named.status == CandDone, named.errorText ?: @"named download completed");
-                  NSString *namedPath = [testOutputRoot stringByAppendingPathComponent:@"MIDV-530-LXT/MIDV-530-LXT.mp4"];
+                  NSString *namedPath = [testOutputRoot stringByAppendingPathComponent:@"MIDV-530-LXT.mp4"];
                   require([[NSData dataWithContentsOfFile:namedPath] isEqual:mp4], @"published video filename uses URL stem");
+                  BOOL folder = NO;
+                  require(![NSFileManager.defaultManager fileExistsAtPath:[testOutputRoot stringByAppendingPathComponent:@"MIDV-530-LXT"]
+                                                             isDirectory:&folder], @"no per-video output folder");
+                  require(![NSFileManager.defaultManager fileExistsAtPath:[testOutputRoot stringByAppendingPathComponent:@"候选 99"]
+                                                             isDirectory:&folder], @"no candidate output folder");
                   expectSuccess(download(base, @"/aes/list.m3u8", @"aes", nil), expectedTS);
                   expectFailure(download(base, @"/broken/list.m3u8", @"missing", nil));
                   expectFailure(download(base, @"/false/list.m3u8", @"false-200", nil));
@@ -385,6 +392,12 @@ jobs:
                   require(requests >= 6 && restarts == 1, @"retries used resume offsets rather than restarting");
                   puts("PASS: six-way range downloading, repeated interruption resume and monotonic progress");
                   puts("PASS: URL-derived MIDV-530-LXT.mp4 filename and proxy/generic naming");
+                  for (NSString *name in [NSFileManager.defaultManager contentsOfDirectoryAtPath:testOutputRoot error:NULL]) {
+                      BOOL isDirectory = NO;
+                      [NSFileManager.defaultManager fileExistsAtPath:[testOutputRoot stringByAppendingPathComponent:name] isDirectory:&isDirectory];
+                      require(!isDirectory, @"download root contains no temporary or per-video folders");
+                  }
+                  puts("PASS: completed videos saved directly in download root");
                   puts("PASS: download fixtures (redirects, headers, MP4, AES sequence, missing pieces, ranges, false-200 and file publication)");
               }
               return 0;
