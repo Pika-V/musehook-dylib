@@ -226,6 +226,27 @@ static BOOL muse_copy_file_range(NSURL *source, NSURL *destination, uint64_t off
     return success;
 }
 
+static NSString *muse_video_basename(NSString *value) {
+    for (NSUInteger depth = 0; depth < 3 && value.length; depth++) {
+        NSURLComponents *parts = [NSURLComponents componentsWithString:value];
+        NSString *component = parts.percentEncodedPath.lastPathComponent;
+        component = component.stringByRemovingPercentEncoding ?: component;
+        NSString *extension = component.pathExtension.lowercaseString;
+        if ([@[@"mp4", @"m4v", @"mov", @"m3u8", @"mkv", @"flv", @"webm", @"ts"] containsObject:extension]) {
+            NSString *name = component.stringByDeletingPathExtension;
+            if (name.length && ![@[@"index", @"master", @"playlist", @"manifest", @"main", @"list", @"start", @"prog_index", @"chunklist"]
+                                containsObject:name.lowercaseString]) return name;
+        }
+        NSString *nested = nil;
+        for (NSURLQueryItem *item in parts.queryItems) {
+            if ([item.name.lowercaseString isEqualToString:@"url"]) { nested = item.value; break; }
+        }
+        if ([nested isEqualToString:value]) break;
+        value = nested;
+    }
+    return nil;
+}
+
 @interface MuseDownloadJob : NSObject
 @property (nonatomic, strong) dispatch_semaphore_t done;
 @property (nonatomic, strong) NSURL *destination;
@@ -1083,7 +1104,11 @@ static BOOL muse_copy_file_range(NSURL *source, NSURL *destination, uint64_t off
             candidate.bytesPerSecond = 0;
             candidate.connections = 1;
             notify_list_changed();
-            NSString *safe = [[candidate.title componentsSeparatedByCharactersInSet:
+            NSURL *url = muse_hls_url(candidate.url, nil);
+            if (!url) @throw [NSException exceptionWithName:@"MuseDownload" reason:@"播放地址无效" userInfo:nil];
+            MuseDownloadJob *probe = [self probeURL:url candidate:candidate];
+            NSString *name = muse_video_basename(candidate.url) ?: muse_video_basename(probe.response.URL.absoluteString) ?: candidate.title;
+            NSString *safe = [[name componentsSeparatedByCharactersInSet:
                               [NSCharacterSet characterSetWithCharactersInString:@"/\\:*?\"<>|\n\r"]]
                              componentsJoinedByString:@"_"];
             if (!safe.length || [safe isEqualToString:@"."] || [safe isEqualToString:@".."]) safe = @"MuseVideo";
@@ -1095,9 +1120,6 @@ static BOOL muse_copy_file_range(NSURL *source, NSURL *destination, uint64_t off
             working = [directory URLByAppendingPathComponent:[@".work-" stringByAppendingString:NSUUID.UUID.UUIDString] isDirectory:YES];
             if (![NSFileManager.defaultManager createDirectoryAtURL:working withIntermediateDirectories:NO attributes:nil error:&error])
                 @throw [NSException exceptionWithName:@"MuseDownload" reason:error.localizedDescription userInfo:nil];
-            NSURL *url = muse_hls_url(candidate.url, nil);
-            if (!url) @throw [NSException exceptionWithName:@"MuseDownload" reason:@"播放地址无效" userInfo:nil];
-            MuseDownloadJob *probe = [self probeURL:url candidate:candidate];
             NSURL *parallel = [self parallelMP4:probe.response candidate:candidate directory:working error:&error];
             if (parallel) {
                 candidate.isFmp4 = YES;

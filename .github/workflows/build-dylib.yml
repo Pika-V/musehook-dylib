@@ -315,6 +315,11 @@ jobs:
                   NSData *media = box("mdat", [@"synthetic media fixture" dataUsingEncoding:NSASCIIStringEncoding]);
                   NSData *mp4 = joined(@[type, movie, media]);
                   [mp4 writeToFile:[fixtures stringByAppendingPathComponent:@"movie.mp4"] atomically:YES];
+                  require([muse_video_basename(@"https://46e9nz.mfpt8g.com/one/original/LXT/MIDV-530-LXT.mp4?token=a%2Fb")
+                           isEqualToString:@"MIDV-530-LXT"], @"URL-derived requested filename");
+                  require([muse_video_basename(@"http://localhost:6001/parse?url=https%3A%2F%2Fcdn.example%2FMIDV-530-LXT.mp4")
+                           isEqualToString:@"MIDV-530-LXT"], @"filename inside playback proxy URL");
+                  require(muse_video_basename(@"https://cdn.example/index.m3u8") == nil, @"generic playlist fallback name");
                   NSData *large = joined(@[type, movie, box("mdat", [NSMutableData dataWithLength:24 * 1024 * 1024])]);
                   [large writeToFile:[fixtures stringByAppendingPathComponent:@"large.mp4"] atomically:YES];
                   NSData *resumable = joined(@[type, movie, box("mdat", [NSMutableData dataWithLength:2 * 1024 * 1024])]);
@@ -338,6 +343,10 @@ jobs:
                                          @{@"Authorization": @"Bearer fixture", @"User-Agent": @"FixturePlayer"}), first);
                   expectFailure(download(base, @"/headers/list.m3u8", @"headers-denied", nil));
                   expectSuccess(download(base, @"/mp4", @"direct", nil), mp4);
+                  MuseCandidate *named = download(base, @"/names/MIDV-530-LXT.mp4?token=fixture", @"候选 99", nil);
+                  require(named.status == CandDone, named.errorText ?: @"named download completed");
+                  NSString *namedPath = [testOutputRoot stringByAppendingPathComponent:@"MIDV-530-LXT/MIDV-530-LXT.mp4"];
+                  require([[NSData dataWithContentsOfFile:namedPath] isEqual:mp4], @"published video filename uses URL stem");
                   expectSuccess(download(base, @"/aes/list.m3u8", @"aes", nil), expectedTS);
                   expectFailure(download(base, @"/broken/list.m3u8", @"missing", nil));
                   expectFailure(download(base, @"/false/list.m3u8", @"false-200", nil));
@@ -375,6 +384,7 @@ jobs:
                   }
                   require(requests >= 6 && restarts == 1, @"retries used resume offsets rather than restarting");
                   puts("PASS: six-way range downloading, repeated interruption resume and monotonic progress");
+                  puts("PASS: URL-derived MIDV-530-LXT.mp4 filename and proxy/generic naming");
                   puts("PASS: download fixtures (redirects, headers, MP4, AES sequence, missing pieces, ranges, false-200 and file publication)");
               }
               return 0;
@@ -492,7 +502,7 @@ jobs:
                       self.playlist("#EXTM3U\n#EXTINF:1,\nt0.ts\n#EXT-X-ENDLIST\n")
                   elif path == "/headers/t0.ts":
                       self.send(self.fixture("ts0.bin"), "video/mp2t")
-                  elif path == "/mp4":
+                  elif path in ("/mp4", "/names/MIDV-530-LXT.mp4"):
                       self.send(self.fixture("movie.mp4"), "video/mp4")
                   elif path == "/aes/list.m3u8":
                       self.playlist("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:123456789012\n"
