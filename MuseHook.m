@@ -247,6 +247,19 @@ static NSString *muse_video_basename(NSString *value) {
     return nil;
 }
 
+static NSString *muse_display_title(NSString *title) {
+    NSString *value = [title stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (!value.length) return nil;
+    static NSRegularExpression *placeholder;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        placeholder = [NSRegularExpression regularExpressionWithPattern:@"^候选\\s*[0-9]+$"
+                                                                 options:0 error:NULL];
+    });
+    if ([placeholder firstMatchInString:value options:0 range:NSMakeRange(0, value.length)]) return nil;
+    return value;
+}
+
 @interface MuseDownloadJob : NSObject
 @property (nonatomic, strong) dispatch_semaphore_t done;
 @property (nonatomic, strong) NSURL *destination;
@@ -1107,7 +1120,8 @@ static NSString *muse_video_basename(NSString *value) {
             NSURL *url = muse_hls_url(candidate.url, nil);
             if (!url) @throw [NSException exceptionWithName:@"MuseDownload" reason:@"播放地址无效" userInfo:nil];
             MuseDownloadJob *probe = [self probeURL:url candidate:candidate];
-            NSString *name = muse_video_basename(candidate.url) ?: muse_video_basename(probe.response.URL.absoluteString) ?: candidate.title;
+            NSString *name = muse_display_title(candidate.title) ?: muse_video_basename(candidate.url) ?:
+                             muse_video_basename(probe.response.URL.absoluteString) ?: candidate.title;
             NSString *safe = [[name componentsSeparatedByCharactersInSet:
                               [NSCharacterSet characterSetWithCharactersInString:@"/\\:*?\"<>|\n\r"]]
                              componentsJoinedByString:@"_"];

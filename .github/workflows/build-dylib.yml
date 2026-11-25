@@ -354,6 +354,13 @@ jobs:
                                                              isDirectory:&folder], @"no per-video output folder");
                   require(![NSFileManager.defaultManager fileExistsAtPath:[testOutputRoot stringByAppendingPathComponent:@"候选 99"]
                                                              isDirectory:&folder], @"no candidate output folder");
+                  NSString *moduleTitle = @"[LTX]新有菜 黑丝封神之作";
+                  MuseCandidate *moduleNamed = download(base, @"/names/MIDV-530-LXT.mp4?title=module", moduleTitle, nil);
+                  expectSuccess(moduleNamed, mp4);
+                  NSString *modulePath = [testOutputRoot stringByAppendingPathComponent:[moduleTitle stringByAppendingPathExtension:@"mp4"]];
+                  require([[NSData dataWithContentsOfFile:modulePath] isEqual:mp4], @"module title overrides URL basename");
+                  require(muse_display_title(@"候选 1") == nil, @"placeholder title falls back to URL basename");
+                  require([muse_display_title(@"  模块标题  ") isEqualToString:@"模块标题"], @"display title whitespace trimmed");
                   expectSuccess(download(base, @"/aes/list.m3u8", @"aes", nil), expectedTS);
                   expectFailure(download(base, @"/broken/list.m3u8", @"missing", nil));
                   expectFailure(download(base, @"/false/list.m3u8", @"false-200", nil));
@@ -398,6 +405,7 @@ jobs:
                       require(!isDirectory, @"download root contains no temporary or per-video folders");
                   }
                   puts("PASS: completed videos saved directly in download root");
+                  puts("PASS: module display title preferred over media URL filename");
                   puts("PASS: download fixtures (redirects, headers, MP4, AES sequence, missing pieces, ranges, false-200 and file publication)");
               }
               return 0;
