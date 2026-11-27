@@ -27,6 +27,8 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <math.h>
+#include <stdint.h>
+#include <limits.h>
 #include <arpa/inet.h>
 #include <CommonCrypto/CommonCryptor.h>
 #include <CommonCrypto/CommonDigest.h>
@@ -143,10 +145,8 @@ static NSString *muse_one_md5(NSString *value) {
     return result;
 }
 
-static NSMutableURLRequest *muse_one_probe_request(NSString *token, NSString *timestamp) {
-    NSDictionary *payload = muse_one_payload(token);
-    NSString *uuid = [payload[@"uuid"] isKindOfClass:NSString.class] ? payload[@"uuid"] : nil;
-    if (!uuid.length || ![[NSUUID alloc] initWithUUIDString:uuid])
+static NSMutableURLRequest *muse_one_probe_request_for_uuid(NSString *token, NSString *timestamp, NSString *uuid) {
+    if (!muse_one_payload(token) || !uuid.length || ![[NSUUID alloc] initWithUUIDString:uuid])
         return nil;
     NSString *inner = muse_one_md5([NSString stringWithFormat:@"0.0.0.0.3.%@..%@", timestamp, uuid]);
     NSString *sign = muse_one_md5([inner stringByAppendingString:@"m4n2hjPeYWkD6tFpqKF^3HO^h24P@idT"]);
@@ -159,6 +159,12 @@ static NSMutableURLRequest *muse_one_probe_request(NSString *token, NSString *ti
         @"uuid": uuid, @"Content-Type": @"application/x-www-form-urlencoded", @"timestamp": timestamp,
         @"platform": @"3", @"token": token, @"sign": sign, @"user-key": @"", @"app-version": @"2.6.4"};
     return request;
+}
+
+static NSMutableURLRequest *muse_one_probe_request(NSString *token, NSString *timestamp) {
+    NSDictionary *payload = muse_one_payload(token);
+    NSString *uuid = [payload[@"uuid"] isKindOfClass:NSString.class] ? payload[@"uuid"] : nil;
+    return muse_one_probe_request_for_uuid(token, timestamp, uuid);
 }
 
 static NSString *muse_one_safe_message(NSString *message) {
@@ -267,6 +273,436 @@ static void muse_one_run_check(void (^completion)(NSString *)) {
         @"检测接口 917api.4c86d03.com；请求包含空 user-key；证书正常验证"];
     if (!tokens.count) [reports addObject:@"未获取 One 凭证，请先在暮色首页等待后再检查"];
     muse_one_check_next(tokens, 0, reports, completion);
+}
+
+// ───────────────────────── One 修复包 ─────────────────────────
+// This key has the same length and Dart hash as token_one_visitor.
+// Canonical table slots, object lengths and cached hashes remain valid.
+static NSString *const kOneCacheAlias = @"token_one_p0zP3K5";
+static NSString *gOneFixResult;
+static NSURL *gOneFixIPA;
+static BOOL gOneFixRunning;
+
+static NSError *muse_one_fix_error(NSInteger code, NSString *message) {
+    return [NSError errorWithDomain:@"MuseHook.OneFix" code:code userInfo:@{NSLocalizedDescriptionKey: message}];
+}
+static uint32_t muse_one_u32(const uint8_t *p) {
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+static uint32_t muse_one_be32(const uint8_t *p) {
+    return (uint32_t)p[3] | (uint32_t)p[2] << 8 | (uint32_t)p[1] << 16 | (uint32_t)p[0] << 24;
+}
+static uint64_t muse_one_u64(const uint8_t *p) {
+    return (uint64_t)muse_one_u32(p) | (uint64_t)muse_one_u32(p + 4) << 32;
+}
+static uint64_t muse_one_be64(const uint8_t *p) {
+    return (uint64_t)muse_one_be32(p + 4) | (uint64_t)muse_one_be32(p) << 32;
+}
+static void muse_one_put_be32(uint8_t *p, uint32_t n) {
+    for (NSUInteger i = 0; i < 4; i++) p[i] = (uint8_t)(n >> (24 - i * 8));
+}
+static BOOL muse_one_bounds(NSUInteger offset, NSUInteger size, NSUInteger total) {
+    return offset <= total && size <= total - offset;
+}
+static uint32_t muse_one_dart_hash(NSString *text) {
+    uint32_t h = 0;
+    for (NSUInteger i = 0; i < text.length; i++) {
+        h += [text characterAtIndex:i]; h += h << 10; h ^= h >> 6;
+    }
+    h += h << 3; h ^= h >> 11; h += h << 15; h &= 0x3fffffff;
+    return h ? h : 1;
+}
+static NSArray<NSValue *> *muse_one_slices(NSData *data, NSError **error) {
+    const uint8_t *b = data.bytes;
+    NSMutableArray<NSValue *> *slices = [NSMutableArray new];
+    if (data.length >= 32 && muse_one_u32(b) == 0xfeedfacf) {
+        [slices addObject:[NSValue valueWithRange:NSMakeRange(0, data.length)]];
+    } else if (data.length >= 8 && (muse_one_be32(b) == 0xcafebabe || muse_one_be32(b) == 0xcafebabf)) {
+        BOOL wide = muse_one_be32(b) == 0xcafebabf;
+        uint32_t count = muse_one_be32(b + 4);
+        NSUInteger width = wide ? 32 : 20;
+        if (!count || count > 16 || !muse_one_bounds(8, count * width, data.length)) goto invalid;
+        for (uint32_t i = 0; i < count; i++) {
+            const uint8_t *arch = b + 8 + i * width;
+            uint64_t offset = wide ? muse_one_be64(arch + 8) : muse_one_be32(arch + 8);
+            uint64_t size = wide ? muse_one_be64(arch + 16) : muse_one_be32(arch + 12);
+            if (!muse_one_bounds((NSUInteger)offset, (NSUInteger)size, data.length) || size < 32 ||
+                muse_one_u32(b + offset) != 0xfeedfacf) goto invalid;
+            [slices addObject:[NSValue valueWithRange:NSMakeRange((NSUInteger)offset, (NSUInteger)size)]];
+        }
+    } else goto invalid;
+    return slices;
+invalid:
+    if (error) *error = muse_one_fix_error(201, @"无法识别安装包中的 Mach-O 文件");
+    return nil;
+}
+static NSDictionary *muse_one_framework_profile(NSData *data, NSError **error) {
+    NSArray<NSValue *> *slices = muse_one_slices(data, error);
+    if (!slices) return nil;
+    const uint8_t *b = data.bytes;
+    NSMutableArray<NSValue *> *keys = [NSMutableArray new], *suffixes = [NSMutableArray new], *uuids = [NSMutableArray new];
+    NSString *fixedUUID;
+    BOOL already = NO, versionSeen = NO, oneSeen = NO;
+    NSUInteger chosen = 0;
+    for (NSValue *value in slices) {
+        NSRange slice = value.rangeValue;
+        const uint8_t *header = b + slice.location;
+        if (muse_one_u32(header + 4) != 0x0100000c) continue;
+        chosen++;
+        uint32_t count = muse_one_u32(header + 16), bytes = muse_one_u32(header + 20);
+        if (count > 1024 || !muse_one_bounds(32, bytes, slice.length)) goto invalid;
+        NSUInteger command = slice.location + 32, end = command + bytes;
+        for (uint32_t c = 0; c < count; c++) {
+            if (!muse_one_bounds(command, 8, end)) goto invalid;
+            uint32_t type = muse_one_u32(b + command), size = muse_one_u32(b + command + 4);
+            if (size < 8 || !muse_one_bounds(command, size, end)) goto invalid;
+            if (type == 0x19) {
+                if (size < 72) goto invalid;
+                uint32_t sections = muse_one_u32(b + command + 64);
+                if (sections > (size - 72) / 80) goto invalid;
+                for (uint32_t s = 0; s < sections; s++) {
+                    const uint8_t *section = b + command + 72 + s * 80;
+                    if (strncmp((const char *)section, "__const", 16) ||
+                        strncmp((const char *)section + 16, "__TEXT", 16)) continue;
+                    uint64_t sectionSize = muse_one_u64(section + 40);
+                    NSUInteger start = slice.location + muse_one_u32(section + 48);
+                    if (sectionSize > 16 * 1024 * 1024 ||
+                        !muse_one_bounds(start, (NSUInteger)sectionSize, slice.location + slice.length)) goto invalid;
+                    NSData *part = [data subdataWithRange:NSMakeRange(start, (NSUInteger)sectionSize)];
+                    NSData *hash = [@"ace654289f5abc240509fc941453ebc5" dataUsingEncoding:NSASCIIStringEncoding];
+                    if ([part rangeOfData:hash options:0 range:NSMakeRange(0, part.length)].location != NSNotFound) versionSeen = YES;
+                    for (NSUInteger pos = 0; pos + 16 <= part.length; pos += 16) {
+                        const uint8_t *object = b + start + pos;
+                        if (((muse_one_u32(object) >> 12) & 0xfffff) != 94) continue;
+                        uint64_t smi = muse_one_u64(object + 8), length = smi / 2;
+                        if ((smi & 1) || length > 100 || !muse_one_bounds(pos + 16, (NSUInteger)length, part.length)) continue;
+                        NSString *text = [[NSString alloc] initWithBytes:object + 16 length:(NSUInteger)length encoding:NSASCIIStringEncoding];
+                        if ([text isEqualToString:@"OneInterceptor"]) oneSeen = YES;
+                        if ([text isEqualToString:@"token_one_visitor"] || [text isEqualToString:kOneCacheAlias]) {
+                            if ((muse_one_u32(object) & 2) == 0 || muse_one_u32(object + 4) != muse_one_dart_hash(text)) goto invalid;
+                            [keys addObject:[NSValue valueWithRange:NSMakeRange(start + pos + 16, (NSUInteger)length)]];
+                            already = [text isEqualToString:kOneCacheAlias];
+                        }
+                        if (length == 38 && [text hasPrefix:@".."] && [[NSUUID alloc] initWithUUIDString:[text substringFromIndex:2]]) {
+                            fixedUUID = [text substringFromIndex:2];
+                            [suffixes addObject:[NSValue valueWithRange:NSMakeRange(start + pos + 16, 38)]];
+                        }
+                        if (length == 36 && [[NSUUID alloc] initWithUUIDString:text])
+                            [uuids addObject:[NSValue valueWithRange:NSMakeRange(start + pos + 16, 36)]];
+                    }
+                }
+            }
+            command += size;
+        }
+        if (command != end) goto invalid;
+    }
+    if (chosen != 1 || !versionSeen || !oneSeen || keys.count != 1 || suffixes.count != 1 ||
+        muse_one_dart_hash(kOneCacheAlias) != muse_one_dart_hash(@"token_one_visitor")) goto invalid;
+    NSUInteger matches = 0;
+    for (NSValue *value in uuids) {
+        NSString *uuid = [[NSString alloc] initWithBytes:b + value.rangeValue.location length:36 encoding:NSASCIIStringEncoding];
+        if ([uuid isEqualToString:fixedUUID]) matches++;
+    }
+    if (matches != 1) goto invalid;
+    return @{@"key": keys.firstObject, @"uuid": fixedUUID, @"already": @(already)};
+invalid:
+    if (error) *error = muse_one_fix_error(202, @"当前 App 的 One 快照布局不匹配，已停止生成补丁");
+    return nil;
+}
+static NSData *muse_one_patch_framework(NSData *data, NSError **error) {
+    NSDictionary *profile = muse_one_framework_profile(data, error);
+    if (!profile) return nil;
+    if ([profile[@"already"] boolValue]) return data;
+    NSRange range = [profile[@"key"] rangeValue];
+    NSData *alias = [kOneCacheAlias dataUsingEncoding:NSASCIIStringEncoding];
+    if (range.length != alias.length || muse_one_dart_hash(@"token_one_visitor") != muse_one_dart_hash(kOneCacheAlias)) return nil;
+    NSMutableData *patched = [data mutableCopy];
+    [patched replaceBytesInRange:range withBytes:alias.bytes length:alias.length];
+    return patched; // Only 17 text bytes change; hashes, tags, gaps and UUIDs are retained.
+}
+
+// An unindexed CMS blob cannot trigger TrollStore's fake-root "already signed" path.
+// Entitlement blobs and their offsets are preserved for normal recursive re-signing.
+static NSData *muse_one_prepare_resign(NSData *data, NSError **error) {
+    NSArray<NSValue *> *slices = muse_one_slices(data, error);
+    if (!slices) return nil;
+    NSMutableData *copy = [data mutableCopy];
+    uint8_t *b = copy.mutableBytes;
+    for (NSValue *value in slices) {
+        NSRange slice = value.rangeValue;
+        uint32_t count = muse_one_u32(b + slice.location + 16), bytes = muse_one_u32(b + slice.location + 20);
+        if (count > 1024 || !muse_one_bounds(32, bytes, slice.length)) goto invalid;
+        NSUInteger command = slice.location + 32, end = command + bytes;
+        for (uint32_t c = 0; c < count; c++) {
+            if (!muse_one_bounds(command, 8, end)) goto invalid;
+            uint32_t type = muse_one_u32(b + command), size = muse_one_u32(b + command + 4);
+            if (size < 8 || !muse_one_bounds(command, size, end)) goto invalid;
+            if (type == 0x1d) {
+                if (size < 16) goto invalid;
+                NSUInteger signature = slice.location + muse_one_u32(b + command + 8);
+                NSUInteger capacity = muse_one_u32(b + command + 12);
+                if (!muse_one_bounds(signature, capacity, slice.location + slice.length) || capacity < 12 ||
+                    muse_one_be32(b + signature) != 0xfade0cc0) goto invalid;
+                uint32_t length = muse_one_be32(b + signature + 4), entries = muse_one_be32(b + signature + 8);
+                if (length > capacity || length < 12 || entries > (length - 12) / 8) goto invalid;
+                NSMutableArray<NSDictionary *> *kept = [NSMutableArray new];
+                for (uint32_t i = 0; i < entries; i++) {
+                    const uint8_t *index = b + signature + 12 + i * 8;
+                    uint32_t slot = muse_one_be32(index), offset = muse_one_be32(index + 4);
+                    if (!muse_one_bounds(offset, 8, length)) goto invalid;
+                    uint32_t blobLength = muse_one_be32(b + signature + offset + 4);
+                    if (blobLength < 8 || !muse_one_bounds(offset, blobLength, length)) goto invalid;
+                    if (slot == 0x10000) continue;
+                    if (muse_one_be32(b + signature + offset) == 0xfade0c02 && blobLength >= 16)
+                        muse_one_put_be32(b + signature + offset + 12, muse_one_be32(b + signature + offset + 12) | 2);
+                    [kept addObject:@{@"slot": @(slot), @"offset": @(offset)}];
+                }
+                muse_one_put_be32(b + signature + 8, (uint32_t)kept.count);
+                for (NSUInteger i = 0; i < kept.count; i++) {
+                    muse_one_put_be32(b + signature + 12 + i * 8, [kept[i][@"slot"] unsignedIntValue]);
+                    muse_one_put_be32(b + signature + 16 + i * 8, [kept[i][@"offset"] unsignedIntValue]);
+                }
+            }
+            command += size;
+        }
+        if (command != end) goto invalid;
+    }
+    return copy;
+invalid:
+    if (error) *error = muse_one_fix_error(203, @"无法保留当前 App 的签名权限，已停止导出");
+    return nil;
+}
+static BOOL muse_one_zip_u16(FILE *file, uint16_t n) {
+    const uint8_t b[] = {(uint8_t)n, (uint8_t)(n >> 8)};
+    return fwrite(b, 1, sizeof(b), file) == sizeof(b);
+}
+static BOOL muse_one_zip_u32(FILE *file, uint32_t n) {
+    return muse_one_zip_u16(file, (uint16_t)n) && muse_one_zip_u16(file, (uint16_t)(n >> 16));
+}
+static uint32_t muse_one_crc(uint32_t crc, const uint8_t *bytes, size_t length) {
+    static uint32_t table[256];
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t n = i;
+            for (uint32_t bit = 0; bit < 8; bit++) n = (n >> 1) ^ ((n & 1) ? 0xedb88320 : 0);
+            table[i] = n;
+        }
+    });
+    for (size_t i = 0; i < length; i++) crc = table[(crc ^ bytes[i]) & 0xff] ^ (crc >> 8);
+    return crc;
+}
+static BOOL muse_one_zip_tree(NSURL *root, NSURL *archive, NSError **error) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSMutableArray<NSURL *> *files = [NSMutableArray new];
+    __block NSError *enumerationFailure;
+    NSDirectoryEnumerator *iterator = [fm enumeratorAtURL:root includingPropertiesForKeys:nil options:0
+        errorHandler:^BOOL(NSURL *url, NSError *failure) { enumerationFailure = failure; return NO; }];
+    for (NSURL *url in iterator) [files addObject:url];
+    if (enumerationFailure) { if (error) *error = enumerationFailure; return NO; }
+    [files sortUsingComparator:^NSComparisonResult(NSURL *a, NSURL *b) { return [a.path compare:b.path]; }];
+    if (files.count > 65535) {
+        if (error) *error = muse_one_fix_error(204, @"安装包文件数量超出 ZIP 格式限制");
+        return NO;
+    }
+    FILE *out = fopen(archive.path.fileSystemRepresentation, "wb");
+    if (!out) { if (error) *error = muse_one_fix_error(205, @"无法创建修复安装包"); return NO; }
+    NSMutableArray<NSDictionary *> *directory = [NSMutableArray new];
+    BOOL success = NO;
+    @try {
+        uint8_t buffer[65536];
+        for (NSURL *url in files) {
+            NSDictionary *attributes = [fm attributesOfItemAtPath:url.path error:error];
+            if (!attributes) goto done;
+            NSString *kind = attributes[NSFileType];
+            BOOL isDirectory = [kind isEqualToString:NSFileTypeDirectory], isLink = [kind isEqualToString:NSFileTypeSymbolicLink];
+            if (!isDirectory && !isLink && ![kind isEqualToString:NSFileTypeRegular]) goto done;
+            NSString *prefix = [root.path stringByAppendingString:@"/"];
+            if (![url.path hasPrefix:prefix]) goto done;
+            NSString *relative = [url.path substringFromIndex:prefix.length];
+            if (isDirectory) relative = [relative stringByAppendingString:@"/"];
+            NSData *name = [relative dataUsingEncoding:NSUTF8StringEncoding];
+            if (!name.length || name.length > 65535) goto done;
+            NSData *link = nil;
+            uint64_t length = isDirectory ? 0 : [attributes[NSFileSize] unsignedLongLongValue];
+            uint32_t crc = 0xffffffff;
+            FILE *input = NULL;
+            if (isLink) {
+                NSString *target = [fm destinationOfSymbolicLinkAtPath:url.path error:error];
+                if (!target) goto done;
+                link = [target dataUsingEncoding:NSUTF8StringEncoding];
+                length = link.length; crc = muse_one_crc(crc, link.bytes, link.length);
+            } else if (!isDirectory) {
+                input = fopen(url.path.fileSystemRepresentation, "rb");
+                if (!input) goto done;
+                size_t amount; uint64_t read = 0;
+                while ((amount = fread(buffer, 1, sizeof(buffer), input))) { crc = muse_one_crc(crc, buffer, amount); read += amount; }
+                BOOL valid = !ferror(input) && read == length; fclose(input);
+                if (!valid) goto done;
+            }
+            crc ^= 0xffffffff;
+            long long position = ftello(out);
+            if (length > UINT32_MAX || position < 0 || (uint64_t)position > UINT32_MAX) goto done;
+            uint32_t mode = [attributes[NSFilePosixPermissions] unsignedIntValue] |
+                (isDirectory ? 0040000 : (isLink ? 0120000 : 0100000));
+            if (!muse_one_zip_u32(out, 0x04034b50) || !muse_one_zip_u16(out, 20) ||
+                !muse_one_zip_u16(out, 0x0800) || !muse_one_zip_u16(out, 0) ||
+                !muse_one_zip_u16(out, 0) || !muse_one_zip_u16(out, 0x5d7c) ||
+                !muse_one_zip_u32(out, crc) || !muse_one_zip_u32(out, (uint32_t)length) ||
+                !muse_one_zip_u32(out, (uint32_t)length) || !muse_one_zip_u16(out, (uint16_t)name.length) ||
+                !muse_one_zip_u16(out, 0) || fwrite(name.bytes, 1, name.length, out) != name.length) goto done;
+            if (isLink) {
+                if (fwrite(link.bytes, 1, link.length, out) != link.length) goto done;
+            } else if (!isDirectory) {
+                input = fopen(url.path.fileSystemRepresentation, "rb");
+                if (!input) goto done;
+                uint64_t written = 0; size_t amount; BOOL copied = YES;
+                while ((amount = fread(buffer, 1, sizeof(buffer), input))) {
+                    if (fwrite(buffer, 1, amount, out) != amount) { copied = NO; break; }
+                    written += amount;
+                }
+                BOOL valid = copied && !ferror(input) && written == length; fclose(input);
+                if (!valid) goto done;
+            }
+            [directory addObject:@{@"name": name, @"crc": @(crc), @"size": @(length), @"offset": @(position), @"mode": @(mode)}];
+        }
+        long long central = ftello(out);
+        if (central < 0 || (uint64_t)central > UINT32_MAX) goto done;
+        for (NSDictionary *item in directory) {
+            NSData *name = item[@"name"];
+            if (!muse_one_zip_u32(out, 0x02014b50) || !muse_one_zip_u16(out, 0x0314) ||
+                !muse_one_zip_u16(out, 20) || !muse_one_zip_u16(out, 0x0800) ||
+                !muse_one_zip_u16(out, 0) || !muse_one_zip_u16(out, 0) ||
+                !muse_one_zip_u16(out, 0x5d7c) || !muse_one_zip_u32(out, [item[@"crc"] unsignedIntValue]) ||
+                !muse_one_zip_u32(out, [item[@"size"] unsignedIntValue]) || !muse_one_zip_u32(out, [item[@"size"] unsignedIntValue]) ||
+                !muse_one_zip_u16(out, (uint16_t)name.length) || !muse_one_zip_u16(out, 0) ||
+                !muse_one_zip_u16(out, 0) || !muse_one_zip_u16(out, 0) || !muse_one_zip_u16(out, 0) ||
+                !muse_one_zip_u32(out, [item[@"mode"] unsignedIntValue] << 16) ||
+                !muse_one_zip_u32(out, [item[@"offset"] unsignedIntValue]) ||
+                fwrite(name.bytes, 1, name.length, out) != name.length) goto done;
+        }
+        long long finish = ftello(out);
+        if (finish < central || (uint64_t)(finish - central) > UINT32_MAX) goto done;
+        success = muse_one_zip_u32(out, 0x06054b50) && muse_one_zip_u16(out, 0) && muse_one_zip_u16(out, 0) &&
+            muse_one_zip_u16(out, (uint16_t)directory.count) && muse_one_zip_u16(out, (uint16_t)directory.count) &&
+            muse_one_zip_u32(out, (uint32_t)(finish - central)) && muse_one_zip_u32(out, (uint32_t)central) && muse_one_zip_u16(out, 0);
+done:
+        if (fflush(out)) success = NO;
+    } @catch (NSException *exception) { success = NO; }
+    if (fclose(out)) success = NO;
+    if (!success && error && !*error) *error = muse_one_fix_error(206, @"修复包写入未完成");
+    return success;
+}
+static void muse_one_fix_validate(NSString *token, NSString *uuid, void (^completion)(BOOL, NSString *)) {
+    NSString *timestamp = [NSString stringWithFormat:@"%.0f", floor([NSDate date].timeIntervalSince1970)];
+    NSMutableURLRequest *request = muse_one_probe_request_for_uuid(token, timestamp, uuid);
+    if (!request) { completion(NO, @"登录凭证无法用于校验"); return; }
+    NSURLSessionConfiguration *configuration = NSURLSessionConfiguration.ephemeralSessionConfiguration;
+    configuration.timeoutIntervalForRequest = 16; configuration.timeoutIntervalForResource = 20; configuration.HTTPShouldSetCookies = NO;
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:configuration delegate:[MuseOneProbeDelegate new] delegateQueue:nil];
+    NSURLSessionDataTask *task = [session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        NSDictionary *json = muse_one_response_json(data);
+        NSInteger status = [(NSHTTPURLResponse *)response statusCode];
+        BOOL success = !error && status == 200 && [json[@"code"] isKindOfClass:NSNumber.class] && [json[@"code"] integerValue] == 200;
+        NSString *message = error ? muse_one_safe_message(error.localizedDescription) :
+            [NSString stringWithFormat:@"HTTP %ld，%@ %@", (long)status,
+                [json[@"code"] isKindOfClass:NSNumber.class] ? [NSString stringWithFormat:@"业务码 %@", json[@"code"]] : @"无法解析响应",
+                muse_one_safe_message(json[@"message"] ?: json[@"msg"])];
+        [session finishTasksAndInvalidate]; completion(success, message);
+    }];
+    [task resume];
+}
+static void muse_one_generate_fix(void (^completion)(NSURL *, NSString *, NSError *)) {
+    NSBundle *bundle = NSBundle.mainBundle;
+    NSString *executable = [bundle objectForInfoDictionaryKey:@"CFBundleExecutable"];
+    if (![bundle.bundleIdentifier isEqualToString:@"com.look.avbox"] ||
+        ![[bundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] isEqualToString:@"1.0.4"] ||
+        ![executable isKindOfClass:NSString.class] || !executable.length || ![executable.lastPathComponent isEqualToString:executable]) {
+        completion(nil, nil, muse_one_fix_error(207, @"此修复仅适用于暮色 1.0.4")); return;
+    }
+    NSString *token = muse_one_token(NSUserDefaults.standardUserDefaults, @"token_one");
+    NSDictionary *payload = muse_one_payload(token);
+    if (![payload[@"exp"] isKindOfClass:NSNumber.class] ||
+        !isfinite([payload[@"exp"] doubleValue]) ||
+        [payload[@"exp"] doubleValue] <= [NSDate date].timeIntervalSince1970) {
+        completion(nil, nil, muse_one_fix_error(208, @"当前登录凭证已失效，请先在暮色首页更新后重试")); return;
+    }
+    NSString *frameworkRelative = @"Frameworks/App.framework/App";
+    NSError *readError = nil;
+    NSData *framework = [NSData dataWithContentsOfFile:[bundle.bundlePath stringByAppendingPathComponent:frameworkRelative]
+                                              options:NSDataReadingMappedIfSafe error:&readError];
+    NSDictionary *profile = framework ? muse_one_framework_profile(framework, &readError) : nil;
+    if (!profile) { completion(nil, nil, readError ?: muse_one_fix_error(202, @"无法识别当前 One 快照")); return; }
+    muse_one_fix_validate(token, profile[@"uuid"], ^(BOOL valid, NSString *verification) {
+        if (!valid) {
+            completion(nil, nil, muse_one_fix_error(209, [@"App 原签名配合登录凭证未通过验证，已停止生成修复包。"
+                stringByAppendingString:verification ?: @""])); return;
+        }
+        NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+        [defaults setObject:token forKey:[@"flutter." stringByAppendingString:kOneCacheAlias]];
+        if (![defaults synchronize]) { completion(nil, nil, muse_one_fix_error(210, @"修复凭证未能保存，已停止生成安装包")); return; }
+        if ([profile[@"already"] boolValue]) { completion(nil, @"One 凭证已更新，强退并重新打开暮色后生效", nil); return; }
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            @autoreleasepool {
+                NSFileManager *fm = NSFileManager.defaultManager;
+                NSURL *stage = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:
+                    [@"muse-one-export-" stringByAppendingString:NSUUID.UUID.UUIDString]] isDirectory:YES];
+                NSURL *tree = [stage URLByAppendingPathComponent:@"tree" isDirectory:YES];
+                NSURL *payloadFolder = [tree URLByAppendingPathComponent:@"Payload" isDirectory:YES];
+                NSURL *copiedBundle = [payloadFolder URLByAppendingPathComponent:bundle.bundleURL.lastPathComponent isDirectory:YES];
+                NSError *error = nil;
+                BOOL ok = [fm createDirectoryAtURL:payloadFolder withIntermediateDirectories:YES attributes:nil error:&error] &&
+                    [fm copyItemAtURL:bundle.bundleURL toURL:copiedBundle error:&error];
+                NSString *documents = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+                NSURL *folder = [NSURL fileURLWithPath:[documents stringByAppendingPathComponent:@"暮色One修复"] isDirectory:YES];
+                NSURL *backup = [folder URLByAppendingPathComponent:@"暮色1.0.4-修复前备份.ipa"];
+                NSURL *backupTemporary = [stage URLByAppendingPathComponent:@"original.ipa.partial"];
+                if (ok) ok = [fm createDirectoryAtURL:folder withIntermediateDirectories:YES attributes:nil error:&error] &&
+                    muse_one_zip_tree(tree, backupTemporary, &error);
+                if (ok) {
+                    if ([fm fileExistsAtPath:backup.path])
+                        ok = [fm replaceItemAtURL:backup withItemAtURL:backupTemporary backupItemName:nil options:0 resultingItemURL:nil error:&error];
+                    else ok = [fm moveItemAtURL:backupTemporary toURL:backup error:&error];
+                }
+                if (ok) {
+                    NSData *patched = muse_one_patch_framework(framework, &error);
+                    NSURL *file = [copiedBundle URLByAppendingPathComponent:frameworkRelative];
+                    ok = patched && [patched writeToURL:file options:NSDataWritingAtomic error:&error] &&
+                        [fm setAttributes:@{NSFilePosixPermissions: @0755} ofItemAtPath:file.path error:&error];
+                }
+                if (ok) {
+                    NSURL *main = [copiedBundle URLByAppendingPathComponent:executable];
+                    NSData *bytes = [NSData dataWithContentsOfURL:main options:0 error:&error];
+                    NSData *unsignedMain = bytes ? muse_one_prepare_resign(bytes, &error) : nil;
+                    ok = unsignedMain && [unsignedMain writeToURL:main options:NSDataWritingAtomic error:&error] &&
+                        [fm setAttributes:@{NSFilePosixPermissions: @0755} ofItemAtPath:main.path error:&error];
+                }
+                if (ok) {
+                    NSURL *infoURL = [copiedBundle URLByAppendingPathComponent:@"Info.plist"];
+                    NSMutableDictionary *info = [[NSDictionary dictionaryWithContentsOfURL:infoURL] mutableCopy];
+                    if (!info) { error = muse_one_fix_error(211, @"无法保留 App 信息"); ok = NO; }
+                    else {
+                        [info removeObjectForKey:@"TSPreAppliedExploitType"]; [info removeObjectForKey:@"TSBundlePreSigned"];
+                        ok = [info writeToURL:infoURL error:&error];
+                    }
+                }
+                NSURL *destination = [folder URLByAppendingPathComponent:@"暮色1.0.4-One修复.ipa"];
+                NSURL *temporary = [stage URLByAppendingPathComponent:@"One修复.ipa.partial"];
+                if (ok) ok = [fm createDirectoryAtURL:folder withIntermediateDirectories:YES attributes:nil error:&error] &&
+                    muse_one_zip_tree(tree, temporary, &error);
+                if (ok) {
+                    if ([fm fileExistsAtPath:destination.path])
+                        ok = [fm replaceItemAtURL:destination withItemAtURL:temporary backupItemName:nil options:0 resultingItemURL:nil error:&error];
+                    else ok = [fm moveItemAtURL:temporary toURL:destination error:&error];
+                }
+                if (ok) [fm removeItemAtURL:stage error:nil];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    completion(ok ? destination : nil, ok ? @"原签名验证成功，One 修复安装包已生成" : nil,
+                               ok ? nil : (error ?: muse_one_fix_error(212, @"生成修复包失败")));
+                });
+            }
+        });
+    });
 }
 
 // ───────────────────────── 候选模型 ─────────────────────────
@@ -1469,12 +1905,22 @@ static NSString *muse_diagnostic_report(void);
                                           handler:^(__unused UIAlertAction *action) {
         [self performSelector:@selector(checkOne) withObject:nil afterDelay:0.35];
     }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"修复 One" style:UIAlertActionStyleDefault
+                                          handler:^(__unused UIAlertAction *action) {
+        [self performSelector:@selector(repairOne) withObject:nil afterDelay:0.35];
+    }]];
+    if (gOneFixIPA && [NSFileManager.defaultManager fileExistsAtPath:gOneFixIPA.path]) {
+        [alert addAction:[UIAlertAction actionWithTitle:@"分享修复安装包" style:UIAlertActionStyleDefault
+                                              handler:^(__unused UIAlertAction *action) {
+            [self performSelector:@selector(shareOneFix) withObject:nil afterDelay:0.35];
+        }]];
+    }
     [alert addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)checkOne {
-    if (gOneCheckRunning) return;
+    if (gOneCheckRunning || gOneFixRunning) return;
     gOneCheckRunning = YES;
     gOneCheckResult = @"正在检查服务器…";
     UIAlertController *progress = [UIAlertController alertControllerWithTitle:@"正在检查 One"
@@ -1490,6 +1936,38 @@ static NSString *muse_diagnostic_report(void);
         if (strongSelf.presentedViewController == progress) {
             [progress dismissViewControllerAnimated:YES completion:^{ [strongSelf showDiagnostics]; }];
         }
+    });
+}
+
+- (void)shareOneFix {
+    if (!gOneFixIPA) return;
+    UIActivityViewController *share = [[UIActivityViewController alloc] initWithActivityItems:@[gOneFixIPA] applicationActivities:nil];
+    share.popoverPresentationController.sourceView = self.view;
+    share.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2, self.view.bounds.size.height / 2, 1, 1);
+    [self presentViewController:share animated:YES completion:nil];
+}
+
+- (void)repairOne {
+    if (gOneFixRunning || gOneCheckRunning) return;
+    gOneFixRunning = YES;
+    gOneFixResult = @"正在验证原 App 签名并准备修复包…";
+    UIAlertController *progress = [UIAlertController alertControllerWithTitle:@"正在修复 One"
+        message:@"请保持已验证可用的网络。验证通过后会生成备份及修复安装包。"
+        preferredStyle:UIAlertControllerStyleAlert];
+    [progress addAction:[UIAlertAction actionWithTitle:@"后台生成" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:progress animated:YES completion:nil];
+    __weak MuseListVC *weakSelf = self;
+    muse_one_generate_fix(^(NSURL *ipa, NSString *message, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            gOneFixRunning = NO;
+            gOneFixIPA = ipa;
+            gOneFixResult = error ? muse_one_safe_message(error.localizedDescription) :
+                (ipa ? [NSString stringWithFormat:@"%@\n修复包 %@\n备份在同一目录", message, ipa.path] : message);
+            mlog(@"One 修复：%@", gOneFixResult);
+            MuseListVC *strongSelf = weakSelf;
+            if (strongSelf.presentedViewController == progress)
+                [progress dismissViewControllerAnimated:YES completion:^{ [strongSelf showDiagnostics]; }];
+        });
     });
 }
 
@@ -1950,12 +2428,13 @@ static NSString *muse_diagnostic_report(void) {
     }
     NSString *logPath = gLogPath ?: [out_dir() stringByAppendingPathComponent:@"hook.log"];
     NSString *report = [NSString stringWithFormat:
-        @"MuseHook One 检查版 2026.11.27\n观察点 %lu/5\n播放器调用 %lu\n播放地址 %lu\n最近入口 %@\n最近地址 %@\n日志 %@",
+        @"MuseHook One 修复包生成版 2026.11.28\n观察点 %lu/5\n播放器调用 %lu\n播放地址 %lu\n最近入口 %@\n最近地址 %@\n日志 %@",
         (unsigned long)atomic_load(&gMediaHooksInstalled),
         (unsigned long)atomic_load(&gMediaCallsObserved),
         (unsigned long)atomic_load(&gMediaURLsObserved),
         event ?: @"等待播放", address ?: @"等待播放", logPath];
-    return [report stringByAppendingFormat:@"\n\n%@", muse_one_local_report()];
+    return [report stringByAppendingFormat:@"\n\n%@\n\nOne 修复\n%@", muse_one_local_report(),
+            gOneFixResult ?: @"点击「修复 One」验证并生成安装包"];
 }
 
 // ───────────────────────── 入口 ─────────────────────────
