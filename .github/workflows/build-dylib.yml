@@ -614,7 +614,7 @@ jobs:
                   check_export([muse_one_patch_framework(patched, &error) isEqualToData:patched], @"patch is idempotent");
                   NSMutableData *bad = [original mutableCopy]; set32(bad, key.location - 12, 0);
                   check_export(muse_one_patch_framework(bad, &error) == nil, @"zero readonly hash rejected");
-                  check_export(muse_one_patch_framework([NSData dataWithLength:12], &error) == nil, @"truncated framework rejected");
+                  check_export(muse_one_patch_framework([NSMutableData dataWithLength:12], &error) == nil, @"truncated framework rejected");
 
                   NSMutableData *fat = [NSMutableData dataWithLength:16384 + original.length];
                   uint8_t *fatBytes = fat.mutableBytes;
