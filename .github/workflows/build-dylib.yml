@@ -30,6 +30,9 @@ jobs:
           #include <stdatomic.h>
           #include <stdio.h>
           #include <stdlib.h>
+          #include <math.h>
+          #include <CommonCrypto/CommonCryptor.h>
+          #include <CommonCrypto/CommonDigest.h>
 
           static _Atomic(BOOL) gReady;
           static NSMutableArray *gCandidates;
@@ -112,6 +115,7 @@ jobs:
           }
           @end
 
+          #include "one-check-core.inc"
           #include "player-capture.inc"
 
           static void require(BOOL condition, NSString *message) {
@@ -187,6 +191,7 @@ jobs:
           @property (atomic, copy) NSString *title;
           @property (atomic, copy) NSDictionary *headers;
           @property (atomic, copy) NSString *errorText;
+          @property (atomic, copy) NSString *outputPath;
           @property (atomic, assign) CandStatus status;
           @property (atomic, assign) double progress;
           @property (atomic, assign) BOOL isFmp4;
@@ -359,6 +364,7 @@ jobs:
                   expectSuccess(moduleNamed, mp4);
                   NSString *modulePath = [testOutputRoot stringByAppendingPathComponent:[moduleTitle stringByAppendingPathExtension:@"mp4"]];
                   require([[NSData dataWithContentsOfFile:modulePath] isEqual:mp4], @"module title overrides URL basename");
+                  require([moduleNamed.outputPath isEqualToString:modulePath], @"diagnostics report actual saved module-title path");
                   require(muse_display_title(@"候选 1") == nil, @"placeholder title falls back to URL basename");
                   require([muse_display_title(@"  模块标题  ") isEqualToString:@"模块标题"], @"display title whitespace trimmed");
                   expectSuccess(download(base, @"/aes/list.m3u8", @"aes", nil), expectedTS);
@@ -412,6 +418,106 @@ jobs:
           }
           '''
 
+          one_test = r'''
+          #import <Foundation/Foundation.h>
+          #include <CommonCrypto/CommonCryptor.h>
+          #include <CommonCrypto/CommonDigest.h>
+          #include <math.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+
+          #include "one-check-core.inc"
+
+          static void require_one(BOOL condition, NSString *message) {
+              if (!condition) {
+                  fprintf(stderr, "FAIL: %s\n", message.UTF8String);
+                  exit(1);
+              }
+          }
+
+          static NSString *fixture_token(NSDictionary *payload) {
+              NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+              NSString *encoded = [[[data base64EncodedStringWithOptions:0]
+                  stringByReplacingOccurrencesOfString:@"+" withString:@"-"] stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+              encoded = [encoded stringByReplacingOccurrencesOfString:@"=" withString:@""];
+              return [NSString stringWithFormat:@"eyJhbGciOiJub25lIn0.%@.synthetic-signature", encoded];
+          }
+
+          int main(int argc, const char *argv[]) {
+              @autoreleasepool {
+                  require_one(argc == 2, @"local fixture URL supplied");
+                  NSDate *now = [NSDate dateWithTimeIntervalSince1970:1793574000];
+                  NSString *uuid = @"11111111-2222-4333-8444-555555555555";
+                  NSString *token = fixture_token(@{@"uuid": uuid, @"exp": @1793574001, @"iss": @"private-account"});
+                  NSString *expired = fixture_token(@{@"uuid": uuid, @"exp": @1793574000});
+                  require_one([muse_one_token_state(nil, now) isEqualToString:@"未获取"], @"absent credentials distinguished");
+                  require_one([muse_one_token_state(@"not-a-jwt", now) isEqualToString:@"格式无效"], @"invalid credentials distinguished");
+                  require_one(muse_one_payload(@"header.%%%.signature") == nil, @"invalid base64 rejected");
+                  require_one(muse_one_payload([token stringByAppendingString:@"\r\n"]) == nil, @"header injection rejected");
+                  require_one(muse_one_probe_request(fixture_token(@{@"uuid": @"x\r\ny"}), @"1793574000") == nil,
+                              @"control characters in the credential UUID rejected");
+                  NSString *state = muse_one_token_state(token, now);
+                  require_one([state containsString:@"本地有效期未过"] && [state containsString:@"UUID 存在"], @"local expiry and UUID presence reported");
+                  require_one(![state containsString:uuid] && ![state containsString:@"private-account"] && ![state containsString:token], @"credential values absent from reports");
+                  require_one([muse_one_token_state(expired, now) containsString:@"已过期"], @"expiry boundary rejected");
+                  require_one([muse_one_token_state(fixture_token(@{}), now) containsString:@"UUID 缺失"], @"missing matching UUID reported");
+
+                  NSString *suite = [@"MuseHook.OneTest." stringByAppendingString:NSUUID.UUID.UUIDString];
+                  NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:suite];
+                  [defaults setObject:[@"Bearer " stringByAppendingString:token] forKey:@"flutter.token_one"];
+                  require_one([muse_one_token(defaults, @"token_one") isEqualToString:token], @"Flutter-prefixed credential and Bearer prefix read");
+                  [defaults setObject:@123 forKey:@"flutter.token_one_visitor"];
+                  require_one(muse_one_token(defaults, @"token_one_visitor") == nil, @"invalid preference type rejected");
+                  [defaults removePersistentDomainForName:suite];
+
+                  NSMutableURLRequest *request = muse_one_probe_request(token, @"1793574000");
+                  require_one([request.HTTPMethod isEqualToString:@"POST"], @"navigation method preserved");
+                  require_one([[request valueForHTTPHeaderField:@"user-key"] isEqualToString:@""], @"empty user-key retained");
+                  require_one([[request valueForHTTPHeaderField:@"uuid"] isEqualToString:uuid], @"UUID comes from the supplied credential");
+                  require_one([[request valueForHTTPHeaderField:@"sign"] isEqualToString:@"21213419c76ddd53f388fa0d70d76f13"], @"signature matches independent golden fixture");
+
+                  MuseOneProbeDelegate *delegate = [MuseOneProbeDelegate new];
+                  __block NSURLRequest *redirected = request;
+                  [delegate URLSession:nil task:nil willPerformHTTPRedirection:nil
+                      newRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:@"https://other.example/steal"]]
+                      completionHandler:^(NSURLRequest *next) { redirected = next; }];
+                  require_one(redirected == nil, @"credentials cannot follow a redirect to another host");
+
+                  NSString *sensitive = [NSString stringWithFormat:@"expired %@ Bearer %@ token=not-for-the-report", token, token];
+                  NSString *safe = muse_one_safe_message(sensitive);
+                  require_one(![safe containsString:token] && ![safe containsString:@"not-for-the-report"], @"server messages redact credential material");
+                  require_one(![muse_one_safe_message(uuid) containsString:uuid], @"server-echoed UUID redacted");
+                  NSData *errorJSON = [@"{\"code\":401,\"message\":\"expired\"}" dataUsingEncoding:NSUTF8StringEncoding];
+                  require_one([muse_one_response_json(errorJSON)[@"code"] integerValue] == 401, @"plain HTTP error body decoded");
+                  NSData *encryptedError = [@"\"U6S15BTUHatEKH8seeEs/IQDTgt/SEuEOacjD9WsDbDWTqjjox4vknp3Qi01GxOL\""
+                      dataUsingEncoding:NSUTF8StringEncoding];
+                  require_one([muse_one_response_json(encryptedError)[@"message"] isEqualToString:@"expired"],
+                              @"encrypted API error decoded from an independent AES fixture");
+                  const unsigned char invalid[] = {0xff, 0xfe, 0xfd};
+                  require_one(muse_one_response_json([NSData dataWithBytes:invalid length:sizeof(invalid)]) == nil, @"binary refusal response handled safely");
+
+                  request.URL = [NSURL URLWithString:[[NSString stringWithUTF8String:argv[1]] stringByAppendingString:@"/one-navigation-check"]];
+                  dispatch_semaphore_t done = dispatch_semaphore_create(0);
+                  __block NSData *received;
+                  __block NSError *networkError;
+                  __block NSInteger status = 0;
+                  NSURLSessionDataTask *task = [NSURLSession.sharedSession dataTaskWithRequest:request
+                      completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+                          received = data; networkError = error; status = [(NSHTTPURLResponse *)response statusCode];
+                          dispatch_semaphore_signal(done);
+                      }];
+                  [task resume];
+                  require_one(dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)) == 0,
+                              @"navigation fixture completed");
+                  require_one(networkError == nil && status == 200, @"empty user-key and matching signature arrive on the wire");
+                  NSDictionary *observed = muse_one_response_json(received);
+                  require_one([observed[@"empty_user_key"] boolValue] && [observed[@"signed_for_uuid"] boolValue], @"fixture observed the required request fields");
+                  puts("PASS: One credential expiry, privacy, UUID/signature, redirect isolation and empty header transmission");
+              }
+              return 0;
+          }
+          '''
+
           server = r'''
           import argparse
           from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -451,6 +557,19 @@ jobs:
 
               def fixture(self, name):
                   return (args.fixtures / name).read_bytes()
+
+              def do_POST(self):
+                  if self.path != "/one-navigation-check":
+                      self.send(b"missing", "text/plain", 404)
+                      return
+                  self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                  empty_user_key = "user-key" in self.headers and self.headers.get("user-key") == ""
+                  signed_for_uuid = (self.headers.get("uuid") == "11111111-2222-4333-8444-555555555555" and
+                                     self.headers.get("timestamp") == "1793574000" and
+                                     self.headers.get("sign") == "21213419c76ddd53f388fa0d70d76f13")
+                  status = 200 if empty_user_key and signed_for_uuid else 401
+                  self.send(json.dumps({"code": status, "empty_user_key": empty_user_key,
+                                        "signed_for_uuid": signed_for_uuid}).encode(), "application/json", status)
 
               def do_GET(self):
                   global resume_drops, parallel_active, parallel_peak
@@ -582,18 +701,23 @@ jobs:
           bootstrap_start = source.index("// ───────────────────────── 入口", player_start)
           download_start = source.index("// ───────────────────────── 下载器")
           ui_start = source.index("// ───────────────────────── 列表 UI", download_start)
+          one_start = source.index("// ───────────────────────── One 检查")
+          candidate_start = source.index("// ───────────────────────── 候选模型", one_start)
           target = Path(os.environ["RUNNER_TEMP"]) / "musehook-player-tests"
           target.mkdir(parents=True, exist_ok=True)
           (target / "player-capture.inc").write_text(source[player_start:bootstrap_start], encoding="utf-8")
           (target / "download-core.inc").write_text(source[download_start:ui_start], encoding="utf-8")
+          (target / "one-check-core.inc").write_text(source[one_start:candidate_start], encoding="utf-8")
           (target / "player-capture-tests.m").write_text(player_test, encoding="utf-8")
           (target / "download-core-tests.m").write_text(download_test, encoding="utf-8")
+          (target / "one-check-tests.m").write_text(one_test, encoding="utf-8")
           (target / "download-fixture-server.py").write_text(server, encoding="utf-8")
           PY
           TEST_DIR="$RUNNER_TEMP/musehook-player-tests"
           xcrun clang -fobjc-arc -framework Foundation "$TEST_DIR/player-capture-tests.m" -o "$TEST_DIR/player-capture-tests"
           "$TEST_DIR/player-capture-tests"
           xcrun clang -fobjc-arc -framework Foundation "$TEST_DIR/download-core-tests.m" -o "$TEST_DIR/download-core-tests"
+          xcrun clang -fobjc-arc -framework Foundation "$TEST_DIR/one-check-tests.m" -o "$TEST_DIR/one-check-tests"
           python3 - <<'PY'
           import os
           from pathlib import Path
@@ -616,6 +740,7 @@ jobs:
               else:
                   raise RuntimeError("Fixture server did not start")
               base = "http://127.0.0.1:" + port_file.read_text().strip()
+              subprocess.run([str(target / "one-check-tests"), base], check=True, timeout=30)
               subprocess.run([str(target / "download-core-tests"), base, str(fixture_dir), str(output_dir)],
                              check=True, timeout=120)
           finally:

@@ -26,8 +26,10 @@
 #include <strings.h>
 #include <ctype.h>
 #include <stdio.h>
+#include <math.h>
 #include <arpa/inet.h>
 #include <CommonCrypto/CommonCryptor.h>
+#include <CommonCrypto/CommonDigest.h>
 
 // ───────────────────────── 输出目录 ─────────────────────────
 static NSString *const kSharedDir = @"/var/mobile/Media/暮色下载";
@@ -71,6 +73,202 @@ static void mlog(NSString *fmt, ...) {
     }
 }
 
+// ───────────────────────── One 检查 ─────────────────────────
+static NSString *gOneCheckResult;
+static BOOL gOneCheckRunning;
+
+static NSString *muse_one_token(NSUserDefaults *defaults, NSString *name) {
+    id value = [defaults objectForKey:[@"flutter." stringByAppendingString:name]];
+    if (![value isKindOfClass:NSString.class]) value = [defaults objectForKey:name];
+    if (![value isKindOfClass:NSString.class]) return nil;
+    NSString *token = [value stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if ([token hasPrefix:@"Bearer "]) token = [token substringFromIndex:7];
+    return token.length ? token : nil;
+}
+
+static NSDictionary *muse_one_payload(NSString *token) {
+    if (!token.length || token.length > 16384) return nil;
+    NSArray<NSString *> *parts = [token componentsSeparatedByString:@"."];
+    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:
+        @"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-."];
+    if (parts.count != 3 || ![parts[0] length] || ![parts[1] length] || ![parts[2] length] ||
+        [token rangeOfCharacterFromSet:allowed.invertedSet].location != NSNotFound) return nil;
+    NSString *base64 = [[parts[1] stringByReplacingOccurrencesOfString:@"-" withString:@"+"]
+                        stringByReplacingOccurrencesOfString:@"_" withString:@"/"];
+    while (base64.length % 4) base64 = [base64 stringByAppendingString:@"="];
+    NSData *data = [[NSData alloc] initWithBase64EncodedString:base64 options:0];
+    if (!data.length) return nil;
+    id object = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    return [object isKindOfClass:NSDictionary.class] ? object : nil;
+}
+
+static NSString *muse_one_date(NSDate *date) {
+    NSDateFormatter *formatter = [NSDateFormatter new];
+    formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    formatter.dateFormat = @"yyyy-MM-dd HH:mm:ss ZZZZZ";
+    return [formatter stringFromDate:date];
+}
+
+static NSString *muse_one_token_state(NSString *token, NSDate *now) {
+    if (!token.length) return @"未获取";
+    NSDictionary *payload = muse_one_payload(token);
+    if (!payload) return @"格式无效";
+    id exp = payload[@"exp"];
+    NSString *state = @"未标明有效期";
+    if ([exp isKindOfClass:NSNumber.class] && isfinite([exp doubleValue]) && [exp doubleValue] > 0) {
+        NSDate *expires = [NSDate dateWithTimeIntervalSince1970:[exp doubleValue]];
+        state = [NSString stringWithFormat:@"%@（%@）",
+                 [expires compare:now] != NSOrderedDescending ? @"已过期" : @"本地有效期未过",
+                 muse_one_date(expires)];
+    }
+    BOOL hasUUID = [payload[@"uuid"] isKindOfClass:NSString.class] && [payload[@"uuid"] length] > 0;
+    return [state stringByAppendingFormat:@"；UUID %@", hasUUID ? @"存在" : @"缺失"];
+}
+
+static NSString *muse_one_local_report(void) {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSDate *now = [NSDate date];
+    return [NSString stringWithFormat:@"One 检查\n手机时间 %@\n登录凭证 %@\n游客凭证 %@\n%@",
+            muse_one_date(now), muse_one_token_state(muse_one_token(defaults, @"token_one"), now),
+            muse_one_token_state(muse_one_token(defaults, @"token_one_visitor"), now),
+            gOneCheckResult ?: @"点击「检查 One」获取服务器原因"];
+}
+
+static NSString *muse_one_md5(NSString *value) {
+    NSData *data = [value dataUsingEncoding:NSUTF8StringEncoding];
+    unsigned char bytes[CC_MD5_DIGEST_LENGTH];
+    CC_MD5(data.bytes, (CC_LONG)data.length, bytes);
+    NSMutableString *result = [NSMutableString stringWithCapacity:32];
+    for (NSUInteger index = 0; index < sizeof(bytes); index++) [result appendFormat:@"%02x", bytes[index]];
+    return result;
+}
+
+static NSMutableURLRequest *muse_one_probe_request(NSString *token, NSString *timestamp) {
+    NSDictionary *payload = muse_one_payload(token);
+    NSString *uuid = [payload[@"uuid"] isKindOfClass:NSString.class] ? payload[@"uuid"] : nil;
+    if (!uuid.length || ![[NSUUID alloc] initWithUUIDString:uuid])
+        return nil;
+    NSString *inner = muse_one_md5([NSString stringWithFormat:@"0.0.0.0.3.%@..%@", timestamp, uuid]);
+    NSString *sign = muse_one_md5([inner stringByAppendingString:@"m4n2hjPeYWkD6tFpqKF^3HO^h24P@idT"]);
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:
+        [NSURL URLWithString:@"https://917api.4c86d03.com/v2.5/navigation/getDemandTagList"]];
+    request.HTTPMethod = @"POST";
+    request.HTTPBody = [NSData data];
+    request.timeoutInterval = 16;
+    request.allHTTPHeaderFields = @{@"User-Agent": @"Dart/3.12 (dart:io)", @"ip": @"0.0.0.0",
+        @"uuid": uuid, @"Content-Type": @"application/x-www-form-urlencoded", @"timestamp": timestamp,
+        @"platform": @"3", @"token": token, @"sign": sign, @"user-key": @"", @"app-version": @"2.6.4"};
+    return request;
+}
+
+static NSString *muse_one_safe_message(NSString *message) {
+    if (![message isKindOfClass:NSString.class]) return @"";
+    NSString *safe = message;
+    for (NSString *pattern in @[@"eyJ[A-Za-z0-9_-]*(?:\\.[A-Za-z0-9_-]*){0,2}",
+                                @"(?i)Bearer\\s+[^\\s\\\"'<>]+",
+                                @"(?i)(?:token|uuid|password|secret)\\s*[:=]\\s*[^\\s,;\\\"'<>]+",
+                                @"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}",
+                                @"[A-Za-z0-9_+/%=-]{48,}"]) {
+        NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:pattern options:0 error:nil];
+        safe = [regex stringByReplacingMatchesInString:safe options:0 range:NSMakeRange(0, safe.length)
+                                         withTemplate:@"[已隐藏凭证]"];
+    }
+    safe = [[safe componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet] componentsJoinedByString:@" "];
+    return safe.length > 180 ? [[safe substringToIndex:180] stringByAppendingString:@"…"] : safe;
+}
+
+static NSDictionary *muse_one_response_json(NSData *data) {
+    if (!data.length || data.length > 1024 * 1024) return nil;
+    id object = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingFragmentsAllowed error:nil];
+    if ([object isKindOfClass:NSDictionary.class]) return object;
+    NSString *encoded = [object isKindOfClass:NSString.class] ? object :
+        [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    encoded = [encoded stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (!encoded.length) return nil;
+    NSData *cipher = [[NSData alloc] initWithBase64EncodedString:encoded options:0];
+    if (!cipher.length || cipher.length % kCCBlockSizeAES128) return nil;
+    NSMutableData *plain = [NSMutableData dataWithLength:cipher.length + kCCBlockSizeAES128];
+    size_t written = 0;
+    CCCryptorStatus status = CCCrypt(kCCDecrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
+        "l*bv%Ziq000Biaog", kCCKeySizeAES128, "8597506002939249",
+        cipher.bytes, cipher.length, plain.mutableBytes, plain.length, &written);
+    if (status != kCCSuccess) return nil;
+    plain.length = written;
+    object = [NSJSONSerialization JSONObjectWithData:plain options:0 error:nil];
+    return [object isKindOfClass:NSDictionary.class] ? object : nil;
+}
+
+@interface MuseOneProbeDelegate : NSObject <NSURLSessionTaskDelegate>
+@end
+@implementation MuseOneProbeDelegate
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task
+willPerformHTTPRedirection:(NSHTTPURLResponse *)response newRequest:(NSURLRequest *)request
+ completionHandler:(void (^)(NSURLRequest *))completionHandler {
+    NSURL *url = request.URL;
+    BOOL sameOrigin = [url.scheme.lowercaseString isEqualToString:@"https"] &&
+        [url.host.lowercaseString isEqualToString:@"917api.4c86d03.com"] && (!url.port || url.port.integerValue == 443);
+    completionHandler(sameOrigin ? request : nil);
+}
+@end
+
+static void muse_one_check_next(NSArray<NSDictionary *> *tokens, NSUInteger index, NSMutableArray<NSString *> *reports,
+                                void (^completion)(NSString *)) {
+    if (index >= tokens.count) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion([reports componentsJoinedByString:@"\n"]);
+        });
+        return;
+    }
+    NSDictionary *entry = tokens[index];
+    NSString *timestamp = [NSString stringWithFormat:@"%.0f", floor([NSDate date].timeIntervalSince1970)];
+    NSMutableURLRequest *request = muse_one_probe_request(entry[@"token"], timestamp);
+    if (!request) {
+        [reports addObject:[entry[@"name"] stringByAppendingString:@"：无法读取凭证 UUID"]];
+        muse_one_check_next(tokens, index + 1, reports, completion);
+        return;
+    }
+    NSURLSessionConfiguration *configuration = NSURLSessionConfiguration.ephemeralSessionConfiguration;
+    configuration.timeoutIntervalForRequest = 16;
+    configuration.timeoutIntervalForResource = 20;
+    configuration.HTTPShouldSetCookies = NO;
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:configuration delegate:[MuseOneProbeDelegate new] delegateQueue:nil];
+    NSURLSessionDataTask *task = [session dataTaskWithRequest:request completionHandler:
+        ^(NSData *data, NSURLResponse *response, NSError *error) {
+        NSString *result;
+        if (error) {
+            result = [NSString stringWithFormat:@"%@：网络错误 %ld %@", entry[@"name"], (long)error.code,
+                      muse_one_safe_message(error.localizedDescription)];
+        } else {
+            NSInteger status = [(NSHTTPURLResponse *)response statusCode];
+            NSDictionary *json = muse_one_response_json(data);
+            NSString *message = muse_one_safe_message(json[@"message"] ?: json[@"msg"]);
+            id code = [json[@"code"] isKindOfClass:NSNumber.class] ? json[@"code"] : nil;
+            BOOL success = status == 200 && [code integerValue] == 200;
+            result = [NSString stringWithFormat:@"%@：HTTP %ld%@%@%@", entry[@"name"], (long)status,
+                      code ? [NSString stringWithFormat:@"，业务码 %@", code] : @"",
+                      success ? @"，分类接口可用" : @"",
+                      message.length ? [@"，" stringByAppendingString:message] : (json ? @"" : @"，无法解析响应正文")];
+        }
+        [session finishTasksAndInvalidate];
+        [reports addObject:result];
+        muse_one_check_next(tokens, index + 1, reports, completion);
+    }];
+    [task resume];
+}
+
+static void muse_one_run_check(void (^completion)(NSString *)) {
+    NSMutableArray<NSDictionary *> *tokens = [NSMutableArray new];
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSString *login = muse_one_token(defaults, @"token_one");
+    NSString *visitor = muse_one_token(defaults, @"token_one_visitor");
+    if (login.length) [tokens addObject:@{@"name": @"登录凭证检测", @"token": login}];
+    if (visitor.length && ![visitor isEqualToString:login]) [tokens addObject:@{@"name": @"游客凭证检测", @"token": visitor}];
+    NSMutableArray<NSString *> *reports = [NSMutableArray arrayWithObject:
+        @"检测接口 917api.4c86d03.com；请求包含空 user-key；证书正常验证"];
+    if (!tokens.count) [reports addObject:@"未获取 One 凭证，请先在暮色首页等待后再检查"];
+    muse_one_check_next(tokens, 0, reports, completion);
+}
+
 // ───────────────────────── 候选模型 ─────────────────────────
 typedef NS_ENUM(NSInteger, CandStatus) {
     CandIdle = 0, CandRunning, CandDone, CandFailed
@@ -88,6 +286,7 @@ typedef NS_ENUM(NSInteger, CandStatus) {
 @property (atomic, assign) NSUInteger connections;
 @property (atomic, copy) NSDictionary<NSString *, NSString *> *headers;
 @property (atomic, copy) NSString *errorText;
+@property (atomic, copy) NSString *outputPath;
 @end
 
 @implementation MuseCandidate
@@ -1128,6 +1327,8 @@ static NSString *muse_display_title(NSString *title) {
             if (!safe.length || [safe isEqualToString:@"."] || [safe isEqualToString:@".."]) safe = @"MuseVideo";
             if (safe.length > 60) safe = [safe substringWithRange:[safe rangeOfComposedCharacterSequencesForRange:NSMakeRange(0, 60)]];
             if ([safe lengthOfBytesUsingEncoding:NSUTF8StringEncoding] > 180) safe = @"MuseVideo";
+            mlog(@"保存命名 标题[%@] 名称[%@] 模块标题[%@]",
+                 candidate.title, safe, muse_display_title(candidate.title) ?: @"未获得");
             NSURL *directory = [NSURL fileURLWithPath:out_dir() isDirectory:YES];
             if (![NSFileManager.defaultManager createDirectoryAtURL:directory withIntermediateDirectories:YES attributes:nil error:&error])
                 @throw [NSException exceptionWithName:@"MuseDownload" reason:error.localizedDescription userInfo:nil];
@@ -1185,6 +1386,7 @@ static NSString *muse_display_title(NSString *title) {
             if (working) [NSFileManager.defaultManager removeItemAtURL:working error:NULL];
         }
         if (completed) {
+            candidate.outputPath = completed.path;
             candidate.status = CandDone;
             candidate.progress = 1;
             candidate.errorText = nil;
@@ -1246,6 +1448,8 @@ static NSString *muse_diagnostic_report(void);
 - (void)showDiagnostics {
     NSString *report = muse_diagnostic_report();
     for (MuseCandidate *candidate in cand_snapshot()) {
+        report = [report stringByAppendingFormat:@"\n候选标题 %@\n保存路径 %@",
+                  candidate.title, candidate.outputPath ?: @"尚未完成下载"];
         if (candidate.status == CandRunning)
             report = [report stringByAppendingFormat:@"\n下载 %.0f%%，%.0f KB/s，%lu路",
                       candidate.progress * 100, candidate.bytesPerSecond / 1024, (unsigned long)candidate.connections];
@@ -1261,8 +1465,32 @@ static NSString *muse_diagnostic_report(void);
                                           handler:^(__unused UIAlertAction *action) {
         UIPasteboard.generalPasteboard.string = report;
     }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"检查 One" style:UIAlertActionStyleDefault
+                                          handler:^(__unused UIAlertAction *action) {
+        [self performSelector:@selector(checkOne) withObject:nil afterDelay:0.35];
+    }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)checkOne {
+    if (gOneCheckRunning) return;
+    gOneCheckRunning = YES;
+    gOneCheckResult = @"正在检查服务器…";
+    UIAlertController *progress = [UIAlertController alertControllerWithTitle:@"正在检查 One"
+        message:@"分别检查登录和游客凭证，最多约 40 秒。" preferredStyle:UIAlertControllerStyleAlert];
+    [progress addAction:[UIAlertAction actionWithTitle:@"后台检查" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:progress animated:YES completion:nil];
+    __weak MuseListVC *weakSelf = self;
+    muse_one_run_check(^(NSString *result) {
+        gOneCheckRunning = NO;
+        gOneCheckResult = result;
+        mlog(@"%@", muse_one_local_report());
+        MuseListVC *strongSelf = weakSelf;
+        if (strongSelf.presentedViewController == progress) {
+            [progress dismissViewControllerAnimated:YES completion:^{ [strongSelf showDiagnostics]; }];
+        }
+    });
 }
 
 - (void)dealloc {
@@ -1721,12 +1949,13 @@ static NSString *muse_diagnostic_report(void) {
         });
     }
     NSString *logPath = gLogPath ?: [out_dir() stringByAppendingPathComponent:@"hook.log"];
-    return [NSString stringWithFormat:
-        @"MuseHook 播放器抓取版 · 分块续传\n观察点 %lu/5\n播放器调用 %lu\n播放地址 %lu\n最近入口 %@\n最近地址 %@\n日志 %@",
+    NSString *report = [NSString stringWithFormat:
+        @"MuseHook One 检查版 2026.11.27\n观察点 %lu/5\n播放器调用 %lu\n播放地址 %lu\n最近入口 %@\n最近地址 %@\n日志 %@",
         (unsigned long)atomic_load(&gMediaHooksInstalled),
         (unsigned long)atomic_load(&gMediaCallsObserved),
         (unsigned long)atomic_load(&gMediaURLsObserved),
         event ?: @"等待播放", address ?: @"等待播放", logPath];
+    return [report stringByAppendingFormat:@"\n\n%@", muse_one_local_report()];
 }
 
 // ───────────────────────── 入口 ─────────────────────────
